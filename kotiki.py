@@ -2,7 +2,7 @@
 import socket
 import sys
 import asyncio
-
+CHANNEL_ID = "https://t.me/ITkaktusik"
 # Настройки для Windows
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -244,6 +244,21 @@ async def process_target_gender(message: Message, state: FSMContext):
 @router.message(F.text == "🔍 Найти игрока")
 async def find_player(message: Message):
     user_id = message.from_user.id
+    
+    # --- НОВАЯ ПРОВЕРКА ---
+    if not await check_subscription(user_id):
+        await message.answer(
+            f"❌ Чтобы играть, нужно подписаться на канал: {CHANNEL_ID}\n"
+            "Подпишись и нажми кнопку снова!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
+            ])
+        )
+        return
+    # ----------------------
+
+    cursor.execute("SELECT status, age_category, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
+    user_info = cursor.fetchone()
 
     cursor.execute("SELECT status, age_category, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
     user_info = cursor.fetchone()
@@ -367,7 +382,16 @@ async def process_confirm_exit(callback: CallbackQuery):
                                f"⚠️ Соперник завершил игру.\n\n{result_text}\n\nВозвращаемся в главное меню.",
                                reply_markup=get_main_menu())
 
-
+async def check_subscription(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        # Статусы подписчиков: 'creator', 'administrator', 'member'
+        if member.status in ['creator', 'administrator', 'member']:
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Ошибка проверки подписки: {e}")
+        return False
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
