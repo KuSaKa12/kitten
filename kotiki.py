@@ -248,10 +248,10 @@ async def find_player(message: Message):
     # --- НОВАЯ ПРОВЕРКА ---
     if not await check_subscription(user_id):
         await message.answer(
-            f"❌ Чтобы играть, нужно подписаться на канал: {CHANNEL_ID}\n"
+            f"❌ Чтобы играть, нужно подписаться на канал!\n"
             "Подпишись и нажми кнопку снова!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
+                [InlineKeyboardButton(text="📢 Подписаться", url="https://t.me/ITkaktusik")]
             ])
         )
         return
