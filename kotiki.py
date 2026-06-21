@@ -62,6 +62,7 @@ conn.commit()
 
 
 class Registration(StatesGroup):
+    waiting_for_rules = State()
     waiting_for_age = State()
     waiting_for_gender = State()
     waiting_for_target_gender = State()
@@ -74,6 +75,11 @@ def get_age_kb():
         [KeyboardButton(text="13 - 15 лет"), KeyboardButton(text="16 лет и старше")]
     ], resize_keyboard=True, one_time_keyboard=True)
 
+
+def get_rules_kb():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="✅ Я ознакомился, начать!")],
+    ], resize_keyboard=True, one_time_keyboard=True)
 
 def get_gender_kb():
     return ReplyKeyboardMarkup(keyboard=[
@@ -128,6 +134,7 @@ async def cmd_start(message: Message, state: FSMContext):
     cursor.execute("SELECT age_category FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
+    # Если пользователь уже зарегистрирован
     if res and res[0] is not None:
         cursor.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?",
@@ -136,8 +143,19 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("Привет снова! Готов к поиску?", reply_markup=get_main_menu())
         return
 
-    await start_registration_flow(message, state, "Привет! Добро пожаловать в бота знакомств и поиска котиков! 🐾\n")
-
+    # Правила игры
+    rules_text = (
+        "🐾 Добро пожаловать в игру «Котолов»!\n\n"
+        "Чтобы игра приносила радость всем, пожалуйста, соблюдай правила:\n\n"
+        "1️⃣ Будь честен: Не используй фото из интернета. Мы здесь, чтобы делиться живыми эмоциями!\n"
+        "2️⃣ Свежие фото: Присылай снимки, которые сделал сам прямо сейчас. Фотографии из архива годовалой давности не в счет.\n"
+        "3️⃣ Разнообразие: Не спамь одним и тем же котиком 100 раз. Один ракурс — один котик!\n"
+        "4️⃣ Только котики: Отправляй в чат только фотографии кошек.\n\n"
+        "Нажимая кнопку ниже, ты подтверждаешь, что готов играть честно! 🐱"
+    )
+    
+    await message.answer(rules_text, reply_markup=get_rules_kb(), parse_mode="Markdown")
+    await state.set_state(Registration.waiting_for_rules)
 
 # --- КНОПКА: ИЗМЕНИТЬ ПРОФИЛЬ ---
 @router.message(F.text == "⚙️ Изменить профиль")
@@ -155,6 +173,15 @@ async def change_profile(message: Message, state: FSMContext):
         conn.commit()
 
     await start_registration_flow(message, state, "🔄 Сброс настроек анкеты.\n")
+
+@router.message(Registration.waiting_for_rules)
+async def process_rules(message: Message, state: FSMContext):
+    if message.text != "✅ Я ознакомился, начать!":
+        await message.answer("Пожалуйста, нажми кнопку, чтобы подтвердить согласие с правилами.")
+        return
+    
+    await message.answer("Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", reply_markup=get_age_kb())
+    await state.set_state(Registration.waiting_for_age)
 
 
 # --- ПРОЦЕСС РЕГИСТРАЦИИ ---
