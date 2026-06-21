@@ -177,12 +177,16 @@ async def change_profile(message: Message, state: FSMContext):
 
 @router.message(Registration.waiting_for_rules)
 async def process_rules(message: Message, state: FSMContext):
-    if message.text != "✅ Я ознакомился, начать!":
-        await message.answer("Пожалуйста, нажми кнопку, чтобы подтвердить согласие с правилами.")
-        return
-    
-    await message.answer("Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", reply_markup=get_age_kb())
-    await state.set_state(Registration.waiting_for_age)
+    # Проверяем, что нажата именно та самая кнопка
+    if message.text == "✅ Я ознакомился, начать!":
+        await message.answer(
+            "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", 
+            reply_markup=get_age_kb()
+        )
+        await state.set_state(Registration.waiting_for_age)
+    else:
+        # Если пользователь написал что-то другое
+        await message.answer("Пожалуйста, нажми кнопку «✅ Я ознакомился, начать!»")
 
 
 # --- ПРОЦЕСС РЕГИСТРАЦИИ ---
