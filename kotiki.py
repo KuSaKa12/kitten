@@ -154,8 +154,13 @@ async def cmd_start(message: Message, state: FSMContext):
         "4️⃣ Только котики: Отправляй в чат только фотографии кошек.\n\n"
         "Нажимая кнопку ниже, ты подтверждаешь, что готов играть честно! 🐱"
     )
-    
-    await message.answer(rules_text, reply_markup=get_rules_inline_kb(), parse_mode="Markdown")
+    await message.answer(
+        rules_text, 
+        reply_markup=get_rules_inline_kb(), 
+        parse_mode="Markdown"
+    )
+    # Убираем клавиатуру внизу, чтобы не смущала
+    await message.answer("...", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Registration.waiting_for_rules)
 
 # --- КНОПКА: ИЗМЕНИТЬ ПРОФИЛЬ ---
