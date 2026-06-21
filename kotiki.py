@@ -155,11 +155,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "Нажимая кнопку ниже, ты подтверждаешь, что готов играть честно! 🐱"
     )
     
-    await message.answer(
-        rules_text, 
-        reply_markup=get_rules_inline_kb(), 
-        parse_mode="Markdown"
-    )
+    await message.answer(rules_text, reply_markup=get_rules_inline_kb(), parse_mode="Markdown")
     await state.set_state(Registration.waiting_for_rules)
 
 # --- КНОПКА: ИЗМЕНИТЬ ПРОФИЛЬ ---
@@ -181,7 +177,9 @@ async def change_profile(message: Message, state: FSMContext):
 
 @router.callback_query(Registration.waiting_for_rules, F.data == "start_registration")
 async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
-    await callback.message.delete() # Удаляем старое сообщение с кнопкой
+    # Удаляем сообщение с кнопкой, чтобы пользователь не нажал её дважды
+    await callback.message.delete()
+    
     await callback.message.answer(
         "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", 
         reply_markup=get_age_kb()
