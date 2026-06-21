@@ -77,10 +77,10 @@ def get_age_kb():
     ], resize_keyboard=True, one_time_keyboard=True)
 
 
-def get_rules_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="✅ Я ознакомился, начать!")],
-    ], resize_keyboard=True, one_time_keyboard=True)
+def get_rules_inline_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я ознакомился, начать!", callback_data="start_registration")]
+    ])
 
 def get_gender_kb():
     return ReplyKeyboardMarkup(keyboard=[
@@ -155,7 +155,11 @@ async def cmd_start(message: Message, state: FSMContext):
         "Нажимая кнопку ниже, ты подтверждаешь, что готов играть честно! 🐱"
     )
     
-    await message.answer(rules_text, reply_markup=get_rules_kb(), parse_mode="Markdown")
+    await message.answer(
+        rules_text, 
+        reply_markup=get_rules_inline_kb(), 
+        parse_mode="Markdown"
+    )
     await state.set_state(Registration.waiting_for_rules)
 
 # --- КНОПКА: ИЗМЕНИТЬ ПРОФИЛЬ ---
@@ -175,18 +179,15 @@ async def change_profile(message: Message, state: FSMContext):
 
     await start_registration_flow(message, state, "🔄 Сброс настроек анкеты.\n")
 
-@router.message(Registration.waiting_for_rules)
-async def process_rules(message: Message, state: FSMContext):
-    # Проверяем, что нажата именно та самая кнопка
-    if message.text == "✅ Я ознакомился, начать!":
-        await message.answer(
-            "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", 
-            reply_markup=get_age_kb()
-        )
-        await state.set_state(Registration.waiting_for_age)
-    else:
-        # Если пользователь написал что-то другое
-        await message.answer("Пожалуйста, нажми кнопку «✅ Я ознакомился, начать!»")
+@router.callback_query(Registration.waiting_for_rules, F.data == "start_registration")
+async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.delete() # Удаляем старое сообщение с кнопкой
+    await callback.message.answer(
+        "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", 
+        reply_markup=get_age_kb()
+    )
+    await state.set_state(Registration.waiting_for_age)
+    await callback.answer()
 
 
 # --- ПРОЦЕСС РЕГИСТРАЦИИ ---
