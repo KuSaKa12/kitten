@@ -2,7 +2,7 @@
 import socket
 import sys
 import asyncio
-CHANNEL_ID = "https://t.me/ITkaktusik"
+CHANNEL_ID = "@ITkaktusik"
 # Настройки для Windows
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -239,27 +239,23 @@ async def process_target_gender(message: Message, state: FSMContext):
         reply_markup=get_main_menu()
     )
 
-
 # --- ПОИСК ИГРОКА ---
 @router.message(F.text == "🔍 Найти игрока")
 async def find_player(message: Message):
     user_id = message.from_user.id
     
-    # --- НОВАЯ ПРОВЕРКА ---
+    # ПРОВЕРКА ПОДПИСКИ
     if not await check_subscription(user_id):
         await message.answer(
-            f"❌ Чтобы играть, нужно подписаться на канал!\n"
-            "Подпишись и нажми кнопку снова!",
+            f"❌ Чтобы играть, нужно подписаться на наш канал: {CHANNEL_ID}\n\n"
+            "Подпишись и нажми кнопку «🔍 Найти игрока» еще раз!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📢 Подписаться", url="https://t.me/ITkaktusik")]
+                [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
             ])
         )
         return
-    # ----------------------
 
-    cursor.execute("SELECT status, age_category, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
-    user_info = cursor.fetchone()
-
+    # Запрос данных пользователя (один раз)
     cursor.execute("SELECT status, age_category, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
     user_info = cursor.fetchone()
 
