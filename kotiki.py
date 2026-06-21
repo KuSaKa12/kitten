@@ -160,7 +160,7 @@ async def cmd_start(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
     # Убираем клавиатуру внизу, чтобы не смущала
-    await message.answer("...", reply_markup=ReplyKeyboardRemove())
+    await message.answer(f'rules_text', reply_markup=ReplyKeyboardRemove())
     await state.set_state(Registration.waiting_for_rules)
 
 # --- КНОПКА: ИЗМЕНИТЬ ПРОФИЛЬ ---
