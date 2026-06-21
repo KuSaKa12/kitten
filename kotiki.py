@@ -37,7 +37,8 @@ dp = Dispatcher()
 router = Router()
 
 # Подключение к БД
-conn = sqlite3.connect("/app/cat_game.db")
+db_path = "/app/data/cat_game.db"
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
 # Таблица пользователей
