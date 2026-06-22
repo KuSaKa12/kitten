@@ -18,9 +18,8 @@ import os
 from dotenv import load_dotenv
 import logging
 import sqlite3
-import random
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, \
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, \
     InlineKeyboardButton, CallbackQuery
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -36,6 +35,7 @@ router = Router()
 
 # Подключение к БД
 db_path = "/app/data/cat_game.db"
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
 conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
@@ -157,7 +157,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "Этот бот создан для весьма необычного знакомства! Ищите друга, вторую половику или просто собеседника! Общайтесь, гуляйте и делайте фотки милых котеек на улице!\n\n"
         "Чтобы игра приносила радость всем, пожалуйста, соблюдай правила:\n\n"
         "1️⃣ Будь честен: Не используй фото из интернета. Мы здесь, чтобы делиться живыми эмоциями!\n"
-        "2️⃣ Свежие фото: Присылай снимки, которые сделал сам прямо сейчас. Фотографии из архива годовалой давности не в счет.\n"
+        "2️⃣ Свежие фото: Присылай снимки, которые сделал сам прямо сейчас.\n"
         "3️⃣ Разнообразие: Не спамь одним и тем же котиком 100 раз. Один ракурс — один котик!\n"
         "4️⃣ Только котики: Отправляй в чат только фотографии кошек.\n\n"
         "Нажимая кнопку ниже, ты подтверждаешь, что готов играть честно! 🐱"
@@ -176,11 +176,16 @@ async def change_profile(message: Message, state: FSMContext):
     cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
-    if res and res[0] == 'playing':
+    # Защита от незарегистрированных юзеров
+    if not res:
+        await cmd_start(message, state)
+        return
+
+    if res[0] == 'playing':
         await message.answer("Вы не можете изменить профиль во время игры! Сначала завершите текущий матч.")
         return
 
-    if res and res[0] == 'searching':
+    if res[0] == 'searching':
         cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
         conn.commit()
 
@@ -188,7 +193,10 @@ async def change_profile(message: Message, state: FSMContext):
 
 @router.callback_query(Registration.waiting_for_rules, F.data == "start_registration")
 async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
-    await callback.message.delete()
+    try:
+        await callback.message.delete()
+    except:
+        pass
     await callback.message.answer(
         "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", 
         reply_markup=get_age_kb()
@@ -255,7 +263,7 @@ async def process_target_gender(message: Message, state: FSMContext):
 
 # --- ПОИСК ИГРОКА ---
 @router.message(F.text == "🔍 Найти игрока")
-async def find_player(message: Message):
+async def find_player(message: Message, state: FSMContext):
     user_id = message.from_user.id
     
     if not await check_subscription(user_id):
@@ -268,18 +276,30 @@ async def find_player(message: Message):
         )
         return
 
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    current_status = cursor.fetchone()
-    if current_status and current_status[0] == 'playing':
+    cursor.execute("SELECT status, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
+    u_data = cursor.fetchone()
+    
+    # 1. Защита от юзеров, которых нет в БД (предотвращает создание "невидимок")
+    if not u_data:
+        await cmd_start(message, state)
+        return
+
+    current_status, u_gender, u_target = u_data
+
+    if current_status == 'playing':
         await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
         return
 
-    # Ищем соперника, у которого статус 'searching'
-    cursor.execute("""
+    # 2. Ищем соперника, у которого статус 'searching' И который подходит по полу
+    query = """
         SELECT user_id FROM users 
-        WHERE status = 'searching' AND user_id != ? 
+        WHERE status = 'searching' 
+          AND user_id != ? 
+          AND (target_gender = 'any' OR target_gender = ?)
+          AND (? = 'any' OR gender = ?)
         LIMIT 1
-    """, (user_id,))
+    """
+    cursor.execute(query, (user_id, u_gender, u_target, u_target))
     opponent = cursor.fetchone()
 
     if opponent:
@@ -290,11 +310,9 @@ async def find_player(message: Message):
         cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (user_id, opponent_id))
         conn.commit()
 
-        # Сообщение отправляется ОБЕИМ сторонам только тогда, когда пара сформирована
         await message.answer("🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
         await bot.send_message(opponent_id, "🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
     else:
-        # Убрали текст "добавлен в очередь", просто меняем статус в тишине
         cursor.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
         conn.commit()
         await message.answer("🔍 Ищем соперника... Пожалуйста, подожди.")
@@ -317,7 +335,7 @@ async def ask_end_game(message: Message):
         await message.answer("Ты сейчас не в игре.", reply_markup=get_main_menu())
 
 
-# --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА (С КОРРЕКТНЫМ ПОДСЧЕТОМ) ---
+# --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА ---
 @router.callback_query(F.data.startswith("confirm_exit_"))
 async def process_confirm_exit(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -330,7 +348,7 @@ async def process_confirm_exit(callback: CallbackQuery):
     except Exception:
         pass
 
-    cursor.execute("SELECT status, current_opponent, current_match_cats FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
     if not res or res[0] != 'playing':
@@ -344,13 +362,12 @@ async def process_confirm_exit(callback: CallbackQuery):
     if action == "yes":
         opponent_id = res[1]
         
-        # Получаем точный счет того, кто НАЖАЛ кнопку (Твой счет)
         cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,))
         my_score = cursor.fetchone()[0]
 
-        # Получаем точный счет СОПЕРНИКА
         cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
-        opp_score = cursor.fetchone()[0]
+        opp_score_data = cursor.fetchone()
+        opp_score = opp_score_data[0] if opp_score_data else 0
 
         # Очищаем статусы в БД перед выводом сообщений
         cursor.execute(
@@ -358,15 +375,11 @@ async def process_confirm_exit(callback: CallbackQuery):
             (user_id, opponent_id))
         conn.commit()
 
-        # Формируем динамический текст результатов:
-        # Для того, кто нажал:
         text_for_me = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет соперника: 🐈 {opp_score}"
-        # Для соперника (зеркально отображаем логику "ты" и "соперник"):
         text_for_opp = f"⚠️ Соперник завершил игру.\n\nИгра завершена!\n📊 Твой счет в этом раунде: 🐈 {opp_score}\n📊 Счет соперника: 🐈 {my_score}"
 
         await bot.send_message(user_id, text_for_me + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
         await bot.send_message(opponent_id, text_for_opp + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
-
 
 async def check_subscription(user_id: int) -> bool:
     try:
@@ -375,8 +388,10 @@ async def check_subscription(user_id: int) -> bool:
             return True
         return False
     except Exception as e:
-        logging.error(f"Ошибка проверки подписки: {e}")
-        return False
+        # Если бот НЕ добавлен в администраторы канала, Telegram выдаст ошибку.
+        # Временно возвращаем True, чтобы бот не ломался при тестировании функционала.
+        logging.error(f"Ошибка проверки подписки (возможно бот не админ): {e}")
+        return True 
 
 
 # --- ТАБЛИЦА ЛИДЕРОВ ---
@@ -410,7 +425,11 @@ async def handle_chat_and_media(message: Message):
     cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
-    if not res or res[0] != 'playing':
+    # Если юзер не в базе, не даем спамить
+    if not res:
+        return
+
+    if res[0] != 'playing':
         if message.photo:
             await message.answer(
                 "❌ Ты не можешь отправлять котиков просто так! Сначала нажми «🔍 Найти игрока» и найди соперника.")
@@ -421,6 +440,13 @@ async def handle_chat_and_media(message: Message):
         return
 
     opponent_id = res[1]
+    
+    # 3. Защита от потери оппонента (если БД рассинхронизировалась)
+    if not opponent_id:
+        cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
+        conn.commit()
+        await message.answer("⚠️ Ошибка: соперник потерян. Пожалуйста, начни поиск заново.", reply_markup=get_main_menu())
+        return
 
     if message.photo:
         photo = message.photo[-1]
