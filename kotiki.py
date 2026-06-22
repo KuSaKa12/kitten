@@ -274,8 +274,6 @@ async def find_player(message: Message):
         )
         return
 
-    # Запрос данных пользователя (один раз)
-@router.callback_query(F.data.startswith("confirm_exit_"))
 
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ (ОТПРАВКА ИНЛАЙН-КНОПОК) ---
 @router.message(F.text == "🏁 Завершить игру")
