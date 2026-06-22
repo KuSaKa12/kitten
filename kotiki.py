@@ -263,16 +263,38 @@ async def process_target_gender(message: Message, state: FSMContext):
 async def find_player(message: Message):
     user_id = message.from_user.id
     
-    # ПРОВЕРКА ПОДПИСКИ
+    # 1. ПРОВЕРКА ПОДПИСКИ (она уже есть, оставляем)
     if not await check_subscription(user_id):
-        await message.answer(
-            f"❌ Чтобы играть, нужно подписаться на наш канал: {CHANNEL_ID}\n\n"
-            "Подпишись и нажми кнопку «🔍 Найти игрока» еще раз!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
-            ])
-        )
+        # ... (твой код с кнопкой подписки)
         return
+
+    # 2. УСТАНАВЛИВАЕМ СТАТУС "ПОИСК"
+    cursor.execute("UPDATE users SET status = 'searching' WHERE user_id = ?", (user_id,))
+    conn.commit()
+    await message.answer("🔍 Ищем соперника...")
+
+    # 3. ЛОГИКА ПОИСКА (ищем того, кто тоже ищет)
+    # Ищем пользователя со статусом 'searching', который не является самим собой
+    cursor.execute("""
+        SELECT user_id FROM users 
+        WHERE status = 'searching' AND user_id != ? 
+        LIMIT 1
+    """, (user_id,))
+    opponent = cursor.fetchone()
+
+    if opponent:
+        opponent_id = opponent[0]
+        
+        # Нашли! Обновляем обоих на статус 'playing'
+        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ? WHERE user_id = ?", (opponent_id, user_id))
+        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ? WHERE user_id = ?", (user_id, opponent_id))
+        conn.commit()
+
+        await message.answer("🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
+        await bot.send_message(opponent_id, "🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
+    else:
+        # Если никого не нашли, оставляем статус 'searching'
+        await message.answer("⏳ Соперников пока нет, ждем...")
 
 
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ (ОТПРАВКА ИНЛАЙН-КНОПОК) ---
