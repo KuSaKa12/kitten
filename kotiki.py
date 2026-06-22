@@ -1,6 +1,18 @@
 import socket
 import sys
 import asyncio
+import os
+import logging
+import sqlite3
+
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, \
+    InlineKeyboardButton, CallbackQuery
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
 CHANNEL_ID = "@ITkaktusik"
 
 # Настройки для Windows
@@ -14,20 +26,10 @@ if sys.platform == 'win32':
 
     socket.getaddrinfo = new_getaddrinfo
 
-import os
-from dotenv import load_dotenv
-import logging
-import sqlite3
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, \
-    InlineKeyboardButton, CallbackQuery
-from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -66,6 +68,9 @@ class Registration(StatesGroup):
     waiting_for_gender = State()
     waiting_for_target_gender = State()
 
+class ReportState(StatesGroup):
+    waiting_for_text = State()
+
 
 # --- КЛАВИАТУРЫ ---
 def get_age_kb():
@@ -79,6 +84,7 @@ def get_rules_inline_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Я ознакомился, начать!", callback_data="start_registration")]
     ])
+
 
 def get_gender_kb():
     return ReplyKeyboardMarkup(keyboard=[
@@ -106,7 +112,6 @@ def get_game_menu():
     ], resize_keyboard=True)
 
 
-# Инлайн-кнопки подтверждения выхода
 def get_confirm_inline_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -116,6 +121,17 @@ def get_confirm_inline_kb():
     ])
 
 
+async def check_subscription(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ['creator', 'administrator', 'member']:
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Ошибка проверки подписки (возможно бот не админ): {e}")
+        return True 
+
+
 # --- ФУНКЦИЯ СТАРТА РЕГИСТРАЦИИ ---
 async def start_registration_flow(message: Message, state: FSMContext, text_prefix=""):
     await message.answer(
@@ -123,6 +139,7 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
         reply_markup=get_age_kb()
     )
     await state.set_state(Registration.waiting_for_age)
+
 
 @router.message(F.text == "/debug_data")
 async def debug_data(message: Message):
@@ -135,6 +152,35 @@ async def debug_data(message: Message):
         for u in all_users:
             text += f"ID: {u[0]} | Name: {u[1]} | Cats: {u[2]}\n"
         await message.answer(text)
+
+
+# --- СИСТЕМА РЕПОРТОВ ---
+@router.message(Command("report"))
+async def cmd_report(message: Message, state: FSMContext):
+    await message.answer("📝 Напиши своё предложение или баг-репорт <b>одним сообщением</b>, и я передам его создателю бота!", parse_mode="HTML")
+    await state.set_state(ReportState.waiting_for_text)
+
+@router.message(ReportState.waiting_for_text)
+async def process_report(message: Message, state: FSMContext):
+    report_text = message.text
+    user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: {message.from_user.id})"
+    
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID, 
+                f"🔔 <b>Новый отзыв по КотоLOVe!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
+                parse_mode="HTML"
+            )
+            await message.answer("✅ Спасибо! Твой отзыв успешно отправлен разработчику.")
+        except Exception as e:
+            logging.error(f"Ошибка отправки репорта админу: {e}")
+            await message.answer("❌ Произошла ошибка при отправке. Попробуй позже.")
+    else:
+        await message.answer("❌ Администратор бота временно недоступен, но твой репорт принят в космос!")
+    
+    await state.clear()
+
 
 # --- СТАРТ ---
 @router.message(CommandStart())
@@ -169,6 +215,7 @@ async def cmd_start(message: Message, state: FSMContext):
     )
     await state.set_state(Registration.waiting_for_rules)
 
+
 # --- КНОПКА: ИЗМЕНИТЬ ПРОФИЛЬ ---
 @router.message(F.text == "⚙️ Изменить профиль")
 async def change_profile(message: Message, state: FSMContext):
@@ -176,7 +223,6 @@ async def change_profile(message: Message, state: FSMContext):
     cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
-    # Защита от незарегистрированных юзеров
     if not res:
         await cmd_start(message, state)
         return
@@ -190,6 +236,7 @@ async def change_profile(message: Message, state: FSMContext):
         conn.commit()
 
     await start_registration_flow(message, state, "🔄 Сброс настроек анкеты.\n")
+
 
 @router.callback_query(Registration.waiting_for_rules, F.data == "start_registration")
 async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
@@ -279,7 +326,6 @@ async def find_player(message: Message, state: FSMContext):
     cursor.execute("SELECT status, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
     u_data = cursor.fetchone()
     
-    # 1. Защита от юзеров, которых нет в БД (предотвращает создание "невидимок")
     if not u_data:
         await cmd_start(message, state)
         return
@@ -290,7 +336,6 @@ async def find_player(message: Message, state: FSMContext):
         await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
         return
 
-    # 2. Ищем соперника, у которого статус 'searching' И который подходит по полу
     query = """
         SELECT user_id FROM users 
         WHERE status = 'searching' 
@@ -305,7 +350,6 @@ async def find_player(message: Message, state: FSMContext):
     if opponent:
         opponent_id = opponent[0]
         
-        # Обнуляем match_cats и связываем игроков
         cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (opponent_id, user_id))
         cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (user_id, opponent_id))
         conn.commit()
@@ -369,7 +413,6 @@ async def process_confirm_exit(callback: CallbackQuery):
         opp_score_data = cursor.fetchone()
         opp_score = opp_score_data[0] if opp_score_data else 0
 
-        # Очищаем статусы в БД перед выводом сообщений
         cursor.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
             (user_id, opponent_id))
@@ -380,18 +423,6 @@ async def process_confirm_exit(callback: CallbackQuery):
 
         await bot.send_message(user_id, text_for_me + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
         await bot.send_message(opponent_id, text_for_opp + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
-
-async def check_subscription(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        if member.status in ['creator', 'administrator', 'member']:
-            return True
-        return False
-    except Exception as e:
-        # Если бот НЕ добавлен в администраторы канала, Telegram выдаст ошибку.
-        # Временно возвращаем True, чтобы бот не ломался при тестировании функционала.
-        logging.error(f"Ошибка проверки подписки (возможно бот не админ): {e}")
-        return True 
 
 
 # --- ТАБЛИЦА ЛИДЕРОВ ---
@@ -418,6 +449,54 @@ async def show_leaderboard(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
+# --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ ---
+@router.callback_query(F.data.startswith("check_cat:"))
+async def verify_cat_photo(callback: CallbackQuery):
+    data_parts = callback.data.split(":")
+    action = data_parts[1]
+    sender_id = int(data_parts[2])
+    file_unique_id = data_parts[3]
+
+    await callback.answer()
+    
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+    cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (sender_id,))
+    sender_data = cursor.fetchone()
+    if not sender_data or sender_data[0] != 'playing':
+        await callback.message.answer("⚠️ Эта игра уже завершена.")
+        return
+
+    if action == "yes":
+        cursor.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,))
+        if cursor.fetchone():
+            await bot.send_message(sender_id, "❌ Это фото кота уже использовалось в игре! Балл не засчитан.")
+            await callback.message.answer("Это фото уже было засчитано ранее в базе данных.")
+            return
+
+        cursor.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, sender_id))
+        cursor.execute(
+            "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
+            (sender_id,))
+        conn.commit()
+
+        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,))
+        sender_score = cursor.fetchone()[0]
+
+        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (callback.from_user.id,))
+        my_score = cursor.fetchone()[0]
+
+        await bot.send_message(sender_id, f"🎉 Соперник подтвердил твоего котика! Твой счет в этой игре: {sender_score}")
+        await callback.message.answer(f"✅ Засчитано! У соперника теперь {sender_score} 🐈\nТвой счет: {my_score}")
+
+    elif action == "no":
+        await bot.send_message(sender_id, "📸 Соперник отметил твое фото как обычный снимок. Балл за котика не начислен.")
+        await callback.message.answer("Принято! Фото сохранено в истории чата, балл не начислялся.")
+
+
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
 @router.message()
 async def handle_chat_and_media(message: Message):
@@ -425,7 +504,6 @@ async def handle_chat_and_media(message: Message):
     cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
-    # Если юзер не в базе, не даем спамить
     if not res:
         return
 
@@ -441,7 +519,6 @@ async def handle_chat_and_media(message: Message):
 
     opponent_id = res[1]
     
-    # 3. Защита от потери оппонента (если БД рассинхронизировалась)
     if not opponent_id:
         cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
         conn.commit()
@@ -452,31 +529,22 @@ async def handle_chat_and_media(message: Message):
         photo = message.photo[-1]
         file_unique_id = photo.file_unique_id
 
-        cursor.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,))
-        if cursor.fetchone():
-            await message.answer("❌ Это фото уже загружалось в игру! Отправь другое фото.")
-            return
+        verify_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🐱 Да, это кот!", callback_data=f"check_cat:yes:{user_id}:{file_unique_id}"),
+                InlineKeyboardButton(text="📸 Просто фото", callback_data=f"check_cat:no:{user_id}:{file_unique_id}")
+            ]
+        ])
 
-        cursor.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, user_id))
-        cursor.execute(
-            "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
-            (user_id,))
-        conn.commit()
-
-        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,))
-        my_match_count = cursor.fetchone()[0]
-
-        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
-        opp_match_count = cursor.fetchone()[0]
-
-        await message.answer(f"🎉 Котик засчитан! У тебя в этой игре: {my_match_count}")
+        await message.answer("⏳ Отправил фото сопернику на подтверждение...")
         
-        await bot.send_message(
+        await bot.send_photo(
             opponent_id, 
-            f"💥 Соперник нашел котика! У него теперь {my_match_count} шт.\n"
-            f"Твой счет в этой игре: {opp_match_count}. Поторопись!"
+            photo.file_id, 
+            caption="<b>[Фото от соперника]</b>\nЭто котик? Подтверди, чтобы ему засчитался балл! 👇", 
+            reply_markup=verify_kb,
+            parse_mode="HTML"
         )
-        await bot.send_photo(opponent_id, photo.file_id, caption="[Фото кота от соперника!]")
         return
 
     if message.text:
