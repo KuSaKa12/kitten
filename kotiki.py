@@ -410,6 +410,7 @@ async def check_subscription(user_id: int) -> bool:
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
+    # Достаем ник или пишем "Без ника", если он пустой
     cursor.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10")
     leaders = cursor.fetchall()
     
@@ -417,15 +418,21 @@ async def show_leaderboard(message: Message):
         await message.answer("🏆 Пока в таблице лидеров пусто.")
         return
 
+    # Формируем красивую таблицу с помощью HTML
     text = "<b>🏆 ТОП-10 Котоловов:</b>\n\n"
     for i, (username, count) in enumerate(leaders, 1):
-        # Используем HTML-теги для жирного текста и избегаем проблем с Markdown
-        # Заменяем подчеркивания в никах, если они есть, или используем безопасный вывод
-        safe_username = username.replace("_", "\\_") # Если остаешься на Markdown
-        # Для HTML лучше использовать cgi.escape или просто вывод
-        text += f"{i}. @{username} — 🐈 {count}\n"
+        # Если юзернейм есть, используем его, если нет — пишем "Игрок"
+        display_name = f"@{username}" if username and not username.startswith("User_") else "Игрок"
+        
+        # Эмодзи для мест
+        if i == 1: emoji = "🥇"
+        elif i == 2: emoji = "🥈"
+        elif i == 3: emoji = "🥉"
+        else: emoji = "🔹"
+        
+        text += f"{emoji} {display_name} — 🐈 <b>{count}</b>\n"
     
-    # ИСПОЛЬЗУЙ parse_mode="HTML" вместо "Markdown"
+    # Используем parse_mode="HTML", чтобы не было ошибок
     await message.answer(text, parse_mode="HTML")
 
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
