@@ -125,7 +125,17 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
         reply_markup=get_age_kb()
     )
     await state.set_state(Registration.waiting_for_age)
-
+@router.message(F.text == "/debug_data")
+async def debug_data(message: Message):
+    cursor.execute("SELECT user_id, username, total_cats FROM users")
+    all_users = cursor.fetchall()
+    if not all_users:
+        await message.answer("БД пуста!")
+    else:
+        text = "Данные в БД:\n"
+        for u in all_users:
+            text += f"ID: {u[0]} | Name: {u[1]} | Cats: {u[2]}\n"
+        await message.answer(text)
 
 # --- СТАРТ ---
 @router.message(CommandStart())
