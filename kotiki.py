@@ -1,20 +1,19 @@
-
 import socket
 import sys
 import asyncio
 CHANNEL_ID = "@ITkaktusik"
+
 # Настройки для Windows
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     old_getaddrinfo = socket.getaddrinfo
 
-
     def new_getaddrinfo(*args, **kwargs):
         responses = old_getaddrinfo(*args, **kwargs)
         return [r for r in responses if r[0] == socket.AF_INET]
 
-
     socket.getaddrinfo = new_getaddrinfo
+
 import os
 from dotenv import load_dotenv
 import logging
@@ -30,7 +29,6 @@ from aiogram.fsm.state import State, StatesGroup
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -125,6 +123,7 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
         reply_markup=get_age_kb()
     )
     await state.set_state(Registration.waiting_for_age)
+
 @router.message(F.text == "/debug_data")
 async def debug_data(message: Message):
     cursor.execute("SELECT user_id, username, total_cats FROM users")
@@ -145,7 +144,6 @@ async def cmd_start(message: Message, state: FSMContext):
     cursor.execute("SELECT age_category FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
-    # Если пользователь уже зарегистрирован
     if res and res[0] is not None:
         cursor.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?",
@@ -154,10 +152,9 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("Привет снова! Готов к поиску?", reply_markup=get_main_menu())
         return
 
-    # Правила игры
     rules_text = (
         "🐾 Добро пожаловать в игру «Котолов»!\n\n"
-        "Этот бот создандля весьма необычного знакомства! Ищите друга, вторую половинку или просто собседника! Общайтесь, гуляйте и делайте фотки милых котеек на улице!\n\n"
+        "Этот бот создан для весьма необычного знакомства! Ищите друга, вторую половику или просто собеседника! Общайтесь, гуляйте и делайте фотки милых котеек на улице!\n\n"
         "Чтобы игра приносила радость всем, пожалуйста, соблюдай правила:\n\n"
         "1️⃣ Будь честен: Не используй фото из интернета. Мы здесь, чтобы делиться живыми эмоциями!\n"
         "2️⃣ Свежие фото: Присылай снимки, которые сделал сам прямо сейчас. Фотографии из архива годовалой давности не в счет.\n"
@@ -170,7 +167,6 @@ async def cmd_start(message: Message, state: FSMContext):
         reply_markup=get_rules_inline_kb(), 
         parse_mode="Markdown"
     )
-    # Убираем клавиатуру внизу, чтобы не смущала
     await state.set_state(Registration.waiting_for_rules)
 
 # --- КНОПКА: ИЗМЕНИТЬ ПРОФИЛЬ ---
@@ -192,9 +188,7 @@ async def change_profile(message: Message, state: FSMContext):
 
 @router.callback_query(Registration.waiting_for_rules, F.data == "start_registration")
 async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
-    # Удаляем сообщение с кнопкой, чтобы пользователь не нажал её дважды
     await callback.message.delete()
-    
     await callback.message.answer(
         "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", 
         reply_markup=get_age_kb()
@@ -258,23 +252,29 @@ async def process_target_gender(message: Message, state: FSMContext):
         reply_markup=get_main_menu()
     )
 
+
 # --- ПОИСК ИГРОКА ---
 @router.message(F.text == "🔍 Найти игрока")
 async def find_player(message: Message):
     user_id = message.from_user.id
     
-    # 1. ПРОВЕРКА ПОДПИСКИ (она уже есть, оставляем)
     if not await check_subscription(user_id):
-        # ... (твой код с кнопкой подписки)
+        await message.answer(
+            f"❌ Чтобы играть, нужно подписаться на наш канал: {CHANNEL_ID}\n\n"
+            "Подпишись и нажми кнопку «🔍 Найти игрока» еще раз!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
+            ])
+        )
         return
 
-    # 2. УСТАНАВЛИВАЕМ СТАТУС "ПОИСК"
-    cursor.execute("UPDATE users SET status = 'searching' WHERE user_id = ?", (user_id,))
-    conn.commit()
-    await message.answer("🔍 Ищем соперника...")
+    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+    current_status = cursor.fetchone()
+    if current_status and current_status[0] == 'playing':
+        await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
+        return
 
-    # 3. ЛОГИКА ПОИСКА (ищем того, кто тоже ищет)
-    # Ищем пользователя со статусом 'searching', который не является самим собой
+    # Ищем соперника, у которого статус 'searching'
     cursor.execute("""
         SELECT user_id FROM users 
         WHERE status = 'searching' AND user_id != ? 
@@ -285,17 +285,22 @@ async def find_player(message: Message):
     if opponent:
         opponent_id = opponent[0]
         
-        # Нашли! Обновляем обоих на статус 'playing'
-        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ? WHERE user_id = ?", (opponent_id, user_id))
-        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ? WHERE user_id = ?", (user_id, opponent_id))
+        # Обнуляем match_cats и связываем игроков
+        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (opponent_id, user_id))
+        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (user_id, opponent_id))
         conn.commit()
 
+        # Сообщение отправляется ОБЕИМ сторонам только тогда, когда пара сформирована
         await message.answer("🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
         await bot.send_message(opponent_id, "🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
+    else:
+        # Убрали текст "добавлен в очередь", просто меняем статус в тишине
+        cursor.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+        await message.answer("🔍 Ищем соперника... Пожалуйста, подожди.")
 
 
-
-# --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ (ОТПРАВКА ИНЛАЙН-КНОПОК) ---
+# --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ ---
 @router.message(F.text == "🏁 Завершить игру")
 async def ask_end_game(message: Message):
     user_id = message.from_user.id
@@ -312,16 +317,14 @@ async def ask_end_game(message: Message):
         await message.answer("Ты сейчас не в игре.", reply_markup=get_main_menu())
 
 
-# --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА ЧЕРЕЗ CALLBACK ---
+# --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА (С КОРРЕКТНЫМ ПОДСЧЕТОМ) ---
 @router.callback_query(F.data.startswith("confirm_exit_"))
 async def process_confirm_exit(callback: CallbackQuery):
     user_id = callback.from_user.id
     action = callback.data.split("_")[-1]
 
-    # Сразу убираем часы загрузки на кнопке
     await callback.answer()
 
-    # Сначала удаляем сообщение с инлайн-кнопками, чтобы избежать повторных нажатий
     try:
         await callback.message.delete()
     except Exception:
@@ -340,37 +343,45 @@ async def process_confirm_exit(callback: CallbackQuery):
 
     if action == "yes":
         opponent_id = res[1]
-        my_score = res[2]
+        
+        # Получаем точный счет того, кто НАЖАЛ кнопку (Твой счет)
+        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,))
+        my_score = cursor.fetchone()[0]
 
+        # Получаем точный счет СОПЕРНИКА
         cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
         opp_score = cursor.fetchone()[0]
 
-        result_text = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет соперника: 🐈 {opp_score}"
-
+        # Очищаем статусы в БД перед выводом сообщений
         cursor.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
             (user_id, opponent_id))
         conn.commit()
 
-        await bot.send_message(user_id, result_text + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
-        await bot.send_message(opponent_id,
-                               f"⚠️ Соперник завершил игру.\n\n{result_text}\n\nВозвращаемся в главное меню.",
-                               reply_markup=get_main_menu())
+        # Формируем динамический текст результатов:
+        # Для того, кто нажал:
+        text_for_me = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет соперника: 🐈 {opp_score}"
+        # Для соперника (зеркально отображаем логику "ты" и "соперник"):
+        text_for_opp = f"⚠️ Соперник завершил игру.\n\nИгра завершена!\n📊 Твой счет в этом раунде: 🐈 {opp_score}\n📊 Счет соперника: 🐈 {my_score}"
+
+        await bot.send_message(user_id, text_for_me + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
+        await bot.send_message(opponent_id, text_for_opp + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
+
 
 async def check_subscription(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        # Статусы подписчиков: 'creator', 'administrator', 'member'
         if member.status in ['creator', 'administrator', 'member']:
             return True
         return False
     except Exception as e:
         logging.error(f"Ошибка проверки подписки: {e}")
         return False
+
+
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
-    # Достаем ник или пишем "Без ника", если он пустой
     cursor.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10")
     leaders = cursor.fetchall()
     
@@ -378,13 +389,10 @@ async def show_leaderboard(message: Message):
         await message.answer("🏆 Пока в таблице лидеров пусто.")
         return
 
-    # Формируем красивую таблицу с помощью HTML
     text = "<b>🏆 ТОП-10 Котоловов:</b>\n\n"
     for i, (username, count) in enumerate(leaders, 1):
-        # Если юзернейм есть, используем его, если нет — пишем "Игрок"
         display_name = f"@{username}" if username and not username.startswith("User_") else "Игрок"
         
-        # Эмодзи для мест
         if i == 1: emoji = "🥇"
         elif i == 2: emoji = "🥈"
         elif i == 3: emoji = "🥉"
@@ -392,8 +400,8 @@ async def show_leaderboard(message: Message):
         
         text += f"{emoji} {display_name} — 🐈 <b>{count}</b>\n"
     
-    # Используем parse_mode="HTML", чтобы не было ошибок
     await message.answer(text, parse_mode="HTML")
+
 
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
 @router.message()
@@ -429,18 +437,14 @@ async def handle_chat_and_media(message: Message):
             (user_id,))
         conn.commit()
 
-        # Получаем счет ОТПРАВИТЕЛЯ
         cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,))
         my_match_count = cursor.fetchone()[0]
 
-        # Получаем счет ПОЛУЧАТЕЛЯ (оппонента)
         cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
         opp_match_count = cursor.fetchone()[0]
 
-        # Сообщение отправителю:
         await message.answer(f"🎉 Котик засчитан! У тебя в этой игре: {my_match_count}")
         
-        # Сообщение оппоненту:
         await bot.send_message(
             opponent_id, 
             f"💥 Соперник нашел котика! У него теперь {my_match_count} шт.\n"
