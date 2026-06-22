@@ -410,21 +410,21 @@ async def check_subscription(user_id: int) -> bool:
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
-    # Выбираем всех, даже если 0, чтобы видеть участников
+    # Упростим запрос: берем всё и сортируем
     cursor.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10")
     leaders = cursor.fetchall()
     
     if not leaders:
-        await message.answer("Пока нет зарегистрированных игроков.")
+        await message.answer("🏆 Пока в таблице лидеров пусто.")
         return
 
     text = "🏆 ТОП-10 Котоловов:\n\n"
     for i, (username, count) in enumerate(leaders, 1):
-        # Если count 0, можно не выводить или писать "новичок"
-        text += f"{i}. {username} — 🐈 {count}\n"
+        # Добавим эмодзи для красоты
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        text += f"{medal} @{username} — 🐈 {count}\n"
     
     await message.answer(text, parse_mode="Markdown")
-
 
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
 @router.message()
