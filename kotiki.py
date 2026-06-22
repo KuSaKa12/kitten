@@ -275,84 +275,6 @@ async def find_player(message: Message):
         return
 
     # Запрос данных пользователя (один раз)
-    cursor.execute("SELECT status, age_category, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
-    user_info = cursor.fetchone()
-
-    if not user_info:
-        await message.answer("Сначала пройди регистрацию с помощью команды /start")
-        return
-
-    status, my_age, my_gender, my_target = user_info
-
-    if status == 'searching':
-        await message.answer("Ты уже ищешь соперника!")
-        return
-    if status == 'playing':
-        await message.answer("Ты уже в игре!")
-        return
-
-    cursor.execute("UPDATE users SET status = 'searching' WHERE user_id = ?", (user_id,))
-    conn.commit()
-
-    query = '''
-        SELECT user_id FROM users 
-        WHERE status = 'searching' 
-        AND user_id != ? 
-        AND age_category = ?
-    '''
-    params = [user_id, my_age]
-
-    if my_target != 'any':
-        query += " AND gender = ?"
-        params.append(my_target)
-
-    query += " AND (target_gender = 'any' OR target_gender = ?)"
-    params.append(my_gender)
-
-    cursor.execute(query, tuple(params))
-    opponents = cursor.fetchall()
-
-    if opponents:
-        opponent_id = random.choice(opponents)[0]
-
-        cursor.execute(
-            "UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?",
-            (opponent_id, user_id))
-        cursor.execute(
-            "UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?",
-            (user_id, opponent_id))
-        conn.commit()
-
-        match_msg = (
-            "🎮 Пара найдена! Теперь вы в общем чате.\n"
-            "Всё, что вы пишете или отправляете сюда, видит ваш соперник.\n\n"
-            "📸 Иди на улицу и просто присылай сюда фото котиков! Кто найдет больше?\n"
-            "⚠️ Пожалуйста, играйте честно!"
-        )
-        await message.answer(match_msg, reply_markup=get_game_menu())
-        await bot.send_message(opponent_id, match_msg, reply_markup=get_game_menu())
-    else:
-        await message.answer("⏳ Ищу подходящего соперника твоего возраста...", reply_markup=ReplyKeyboardRemove())
-
-
-# --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ (ОТПРАВКА ИНЛАЙН-КНОПОК) ---
-@router.message(F.text == "🏁 Завершить игру")
-async def ask_end_game(message: Message):
-    user_id = message.from_user.id
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-
-    if res and res[0] == 'playing':
-        await message.answer(
-            "⚠️ Ты уверен, что хочешь завершить игру?\n"
-            "Твой счётчик котов в этой игре сбросится!",
-            reply_markup=get_confirm_inline_kb()
-        )
-    else:
-        await message.answer("Ты сейчас не в игре.", reply_markup=get_main_menu())
-
-
-# --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА ЧЕРЕЗ CALLBACK ---
 @router.callback_query(F.data.startswith("confirm_exit_"))
 async def process_confirm_exit(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -402,6 +324,69 @@ async def process_confirm_exit(callback: CallbackQuery):
         f"⚠️ Соперник завершил игру.\n\n🏁 Игра завершена!\n📊 Твой счет: {opp_score}\n📊 Счет соперника: {my_score}\n\nВозвращаемся в главное меню.", 
         reply_markup=get_main_menu()
     )
+
+
+# --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ (ОТПРАВКА ИНЛАЙН-КНОПОК) ---
+@router.message(F.text == "🏁 Завершить игру")
+async def ask_end_game(message: Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+
+    if res and res[0] == 'playing':
+        await message.answer(
+            "⚠️ Ты уверен, что хочешь завершить игру?\n"
+            "Твой счётчик котов в этой игре сбросится!",
+            reply_markup=get_confirm_inline_kb()
+        )
+    else:
+        await message.answer("Ты сейчас не в игре.", reply_markup=get_main_menu())
+
+
+# --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА ЧЕРЕЗ CALLBACK ---
+@router.callback_query(F.data.startswith("confirm_exit_"))
+async def process_confirm_exit(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    action = callback.data.split("_")[-1]
+
+    # Сразу убираем часы загрузки на кнопке
+    await callback.answer()
+
+    # Сначала удаляем сообщение с инлайн-кнопками, чтобы избежать повторных нажатий
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    cursor.execute("SELECT status, current_opponent, current_match_cats FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+
+    if not res or res[0] != 'playing':
+        await bot.send_message(user_id, "Вы уже не находитесь в игре.", reply_markup=get_main_menu())
+        return
+
+    if action == "no":
+        await bot.send_message(user_id, "Отлично, продолжаем игру! Жду фото котиков.")
+        return
+
+    if action == "yes":
+        opponent_id = res[1]
+        my_score = res[2]
+
+        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
+        opp_score = cursor.fetchone()[0]
+
+        result_text = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет соперника: 🐈 {opp_score}"
+
+        cursor.execute(
+            "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
+            (user_id, opponent_id))
+        conn.commit()
+
+        await bot.send_message(user_id, result_text + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
+        await bot.send_message(opponent_id,
+                               f"⚠️ Соперник завершил игру.\n\n{result_text}\n\nВозвращаемся в главное меню.",
+                               reply_markup=get_main_menu())
 
 async def check_subscription(user_id: int) -> bool:
     try:
