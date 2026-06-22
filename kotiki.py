@@ -292,9 +292,7 @@ async def find_player(message: Message):
 
         await message.answer("🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
         await bot.send_message(opponent_id, "🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
-    else:
-        # Если никого не нашли, оставляем статус 'searching'
-        await message.answer("⏳ Соперников пока нет, ждем...")
+
 
 
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ (ОТПРАВКА ИНЛАЙН-КНОПОК) ---
