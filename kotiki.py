@@ -429,12 +429,23 @@ async def handle_chat_and_media(message: Message):
             (user_id,))
         conn.commit()
 
+        # Получаем счет ОТПРАВИТЕЛЯ
         cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,))
-        match_count = cursor.fetchone()[0]
+        my_match_count = cursor.fetchone()[0]
 
-        await message.answer(f"🎉 Котик засчитан! Найдено в этой игре: {match_count}")
-        await bot.send_message(opponent_id,
-                               f"💥 Твой соперник нашел котика! Счет соперника в этой игре: {match_count} шт. Поторопись!")
+        # Получаем счет ПОЛУЧАТЕЛЯ (оппонента)
+        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
+        opp_match_count = cursor.fetchone()[0]
+
+        # Сообщение отправителю:
+        await message.answer(f"🎉 Котик засчитан! У тебя в этой игре: {my_match_count}")
+        
+        # Сообщение оппоненту:
+        await bot.send_message(
+            opponent_id, 
+            f"💥 Соперник нашел котика! У него теперь {my_match_count} шт.\n"
+            f"Твой счет в этой игре: {opp_match_count}. Поторопись!"
+        )
         await bot.send_photo(opponent_id, photo.file_id, caption="[Фото кота от соперника!]")
         return
 
