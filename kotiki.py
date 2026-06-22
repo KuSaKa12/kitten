@@ -276,55 +276,6 @@ async def find_player(message: Message):
 
     # Запрос данных пользователя (один раз)
 @router.callback_query(F.data.startswith("confirm_exit_"))
-async def process_confirm_exit(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    action = callback.data.split("_")[-1]
-    await callback.answer()
-
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    # Получаем данные инициатора
-    cursor.execute("SELECT status, current_opponent, current_match_cats FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-
-    if not res or res[0] != 'playing':
-        await bot.send_message(user_id, "Вы уже не находитесь в игре.", reply_markup=get_main_menu())
-        return
-
-    if action == "no":
-        await bot.send_message(user_id, "Отлично, продолжаем игру! Жду фото котиков.")
-        return
-
-    opponent_id = res[1]
-    
-    # Получаем счет соперника
-    cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
-    opp_res = cursor.fetchone()
-    opp_score = opp_res[0] if opp_res else 0
-    my_score = res[2]
-
-    # Сбрасываем статус сразу для обоих
-    cursor.execute("UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)", (user_id, opponent_id))
-    conn.commit()
-
-    # ФОРМИРУЕМ СООБЩЕНИЯ ОТДЕЛЬНО ДЛЯ КАЖДОГО
-    # Инициатор выхода
-    await bot.send_message(
-        user_id, 
-        f"🏁 Игра завершена!\n📊 Твой счет: {my_score}\n📊 Счет соперника: {opp_score}\n\nВозвращаемся в главное меню.", 
-        reply_markup=get_main_menu()
-    )
-    
-    # Соперник
-    await bot.send_message(
-        opponent_id, 
-        f"⚠️ Соперник завершил игру.\n\n🏁 Игра завершена!\n📊 Твой счет: {opp_score}\n📊 Счет соперника: {my_score}\n\nВозвращаемся в главное меню.", 
-        reply_markup=get_main_menu()
-    )
-
 
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ (ОТПРАВКА ИНЛАЙН-КНОПОК) ---
 @router.message(F.text == "🏁 Завершить игру")
