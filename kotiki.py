@@ -410,7 +410,6 @@ async def check_subscription(user_id: int) -> bool:
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
-    # Упростим запрос: берем всё и сортируем
     cursor.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10")
     leaders = cursor.fetchall()
     
@@ -418,13 +417,16 @@ async def show_leaderboard(message: Message):
         await message.answer("🏆 Пока в таблице лидеров пусто.")
         return
 
-    text = "🏆 ТОП-10 Котоловов:\n\n"
+    text = "<b>🏆 ТОП-10 Котоловов:</b>\n\n"
     for i, (username, count) in enumerate(leaders, 1):
-        # Добавим эмодзи для красоты
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        text += f"{medal} @{username} — 🐈 {count}\n"
+        # Используем HTML-теги для жирного текста и избегаем проблем с Markdown
+        # Заменяем подчеркивания в никах, если они есть, или используем безопасный вывод
+        safe_username = username.replace("_", "\\_") # Если остаешься на Markdown
+        # Для HTML лучше использовать cgi.escape или просто вывод
+        text += f"{i}. @{username} — 🐈 {count}\n"
     
-    await message.answer(text, parse_mode="Markdown")
+    # ИСПОЛЬЗУЙ parse_mode="HTML" вместо "Markdown"
+    await message.answer(text, parse_mode="HTML")
 
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
 @router.message()
