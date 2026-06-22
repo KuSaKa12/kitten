@@ -357,16 +357,14 @@ async def ask_end_game(message: Message):
 async def process_confirm_exit(callback: CallbackQuery):
     user_id = callback.from_user.id
     action = callback.data.split("_")[-1]
-
-    # Сразу убираем часы загрузки на кнопке
     await callback.answer()
 
-    # Сначала удаляем сообщение с инлайн-кнопками, чтобы избежать повторных нажатий
     try:
         await callback.message.delete()
     except Exception:
         pass
 
+    # Получаем данные инициатора
     cursor.execute("SELECT status, current_opponent, current_match_cats FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
@@ -378,24 +376,32 @@ async def process_confirm_exit(callback: CallbackQuery):
         await bot.send_message(user_id, "Отлично, продолжаем игру! Жду фото котиков.")
         return
 
-    if action == "yes":
-        opponent_id = res[1]
-        my_score = res[2]
+    opponent_id = res[1]
+    
+    # Получаем счет соперника
+    cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
+    opp_res = cursor.fetchone()
+    opp_score = opp_res[0] if opp_res else 0
+    my_score = res[2]
 
-        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
-        opp_score = cursor.fetchone()[0]
+    # Сбрасываем статус сразу для обоих
+    cursor.execute("UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)", (user_id, opponent_id))
+    conn.commit()
 
-        result_text = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет соперника: 🐈 {opp_score}"
-
-        cursor.execute(
-            "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
-            (user_id, opponent_id))
-        conn.commit()
-
-        await bot.send_message(user_id, result_text + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
-        await bot.send_message(opponent_id,
-                               f"⚠️ Соперник завершил игру.\n\n{result_text}\n\nВозвращаемся в главное меню.",
-                               reply_markup=get_main_menu())
+    # ФОРМИРУЕМ СООБЩЕНИЯ ОТДЕЛЬНО ДЛЯ КАЖДОГО
+    # Инициатор выхода
+    await bot.send_message(
+        user_id, 
+        f"🏁 Игра завершена!\n📊 Твой счет: {my_score}\n📊 Счет соперника: {opp_score}\n\nВозвращаемся в главное меню.", 
+        reply_markup=get_main_menu()
+    )
+    
+    # Соперник
+    await bot.send_message(
+        opponent_id, 
+        f"⚠️ Соперник завершил игру.\n\n🏁 Игра завершена!\n📊 Твой счет: {opp_score}\n📊 Счет соперника: {my_score}\n\nВозвращаемся в главное меню.", 
+        reply_markup=get_main_menu()
+    )
 
 async def check_subscription(user_id: int) -> bool:
     try:
