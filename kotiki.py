@@ -91,8 +91,8 @@ class ReportState(StatesGroup):
 # --- КЛАВИАТУРЫ ---
 def get_age_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Меньше 10 лет"), KeyboardButton(text="10 - 12 лет")],
-        [KeyboardButton(text="13 - 15 лет"), KeyboardButton(text="16 лет и старше")]
+        [KeyboardButton(text="Меньше 12 лет"), KeyboardButton(text="12 - 14 лет")],
+        [KeyboardButton(text="15 - 17 лет"), KeyboardButton(text="18 лет и старше")]
     ], resize_keyboard=True, one_time_keyboard=True)
 
 def get_rules_inline_kb():
@@ -176,19 +176,19 @@ async def cmd_ban(message: Message, command: CommandObject):
     await perform_ban(target_id)
     await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
 
-
+async def perform_ban(target_id: int):
     # Проверяем, находится ли нарушитель сейчас в игре
     cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,))
     res = cursor.fetchone()
     
-    # Если он в игре, завершаем игру для соперника
+    # Если он в игре, завершаем игру для собеседника
     if res and res[0]:
         opp_id = res[0]
         cursor.execute("UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?", (opp_id,))
         try:
             await bot.send_message(
                 opp_id, 
-                "🚨 Твой соперник был заблокирован администратором за нарушение правил. Игра завершена.", 
+                "🚨 Твой собеседник был заблокирован администратором за нарушение правил. Игра завершена.", 
                 reply_markup=get_main_menu()
             )
         except:
@@ -272,7 +272,7 @@ async def process_report(message: Message, state: FSMContext):
     
     cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
-    opp_id_text = f"Последний оппонент ID: <code>{res[0]}</code>" if res and res[0] else "Оппонента нет"
+    opp_id_text = f"Последний собеседник ID: <code>{res[0]}</code>" if res and res[0] else "Собеседника нет"
 
     user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{user_id}</code>)\n{opp_id_text}"
     report_text = message.text or message.caption or "<i>Без текста</i>"
@@ -356,7 +356,7 @@ async def change_profile(message: Message, state: FSMContext):
         return
 
     if res[0] == 'playing':
-        await message.answer("Вы не можете изменить профиль во время игры! Сначала завершите текущий матч.")
+        await message.answer("Вы не можете изменить профиль во время общения! Сначала завершите текущий диалог.")
         return
 
     if res[0] == 'searching':
@@ -383,7 +383,9 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
 # --- ПРОЦЕСС РЕГИСТРАЦИИ ---
 @router.message(Registration.waiting_for_age)
 async def process_age(message: Message, state: FSMContext):
-    if message.text not in ["Меньше 10 лет", "10 - 12 лет", "13 - 15 лет", "16 лет и старше"]:
+    valid_ages = ["Меньше 12 лет", "12 - 14 лет", "15 - 17 лет", "18 лет и старше"]
+    
+    if message.text not in valid_ages:
         await message.answer("Пожалуйста, выбери вариант на клавиатуре!")
         return
     await state.update_data(age_category=message.text)
@@ -486,12 +488,12 @@ async def find_player(message: Message, state: FSMContext):
         cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (user_id, opponent_id))
         conn.commit()
 
-        await message.answer("🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
-        await bot.send_message(opponent_id, "🎉 Соперник найден! Начинаем игру. Присылай фото котиков!", reply_markup=get_game_menu())
+        await message.answer("🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
+        await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
     else:
         cursor.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
         conn.commit()
-        await message.answer("🔍 Ищем соперника... Пожалуйста, подожди.", reply_markup=get_search_menu())
+        await message.answer("🔍 Ищем собеседника... Пожалуйста, подожди.", reply_markup=get_search_menu())
 
 
 # --- ОСТАНОВКА ПОИСКА ---
@@ -518,7 +520,7 @@ async def ask_end_game(message: Message):
 
     if res and res[0] == 'playing':
         await message.answer(
-            "⚠️ Ты уверен, что хочешь завершить игру?\n"
+            "⚠️ Ты уверен, что хочешь завершить диалог?\n"
             "Твой счётчик котов в этой игре сбросится!",
             reply_markup=get_confirm_inline_kb()
         )
@@ -557,7 +559,6 @@ async def report_player_chat(message: Message):
     
     history_text = ""
     for sender, txt, ts in history:
-        # Упрощаем отображение времени и того, кто пишет
         name = "Нарушитель" if sender == opponent_id else "Жалующийся"
         time_str = ts.split(" ")[1] if " " in ts else ts
         history_text += f"[{time_str}] {name}: {txt}\n"
@@ -565,7 +566,7 @@ async def report_player_chat(message: Message):
     if not history_text:
         history_text = "<i>Сообщений за последние 20 минут в текстовом виде нет.</i>"
     elif len(history_text) > 3000:
-        history_text = history_text[-3000:] # Обрезаем, если история слишком большая для одного сообщения
+        history_text = history_text[-3000:] 
 
     report_msg = (
         f"🚨 <b>ЖАЛОБА НА ОБЩЕНИЕ (Токсичность / Спам)</b>\n\n"
@@ -627,8 +628,8 @@ async def process_confirm_exit(callback: CallbackQuery):
             (user_id, opponent_id))
         conn.commit()
 
-        text_for_me = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет соперника: 🐈 {opp_score}"
-        text_for_opp = f"⚠️ Соперник завершил игру.\n\nИгра завершена!\n📊 Твой счет в этом раунде: 🐈 {opp_score}\n📊 Счет соперника: 🐈 {my_score}"
+        text_for_me = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет собеседника: 🐈 {opp_score}"
+        text_for_opp = f"⚠️ Собеседник завершил игру.\n\nИгра завершена!\n📊 Твой счет в этом раунде: 🐈 {opp_score}\n📊 Счет собеседника: 🐈 {my_score}"
 
         await bot.send_message(user_id, text_for_me + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
         await bot.send_message(opponent_id, text_for_opp + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
@@ -681,7 +682,6 @@ async def verify_cat_photo(callback: CallbackQuery):
     cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (sender_id,))
     sender_data = cursor.fetchone()
     if not sender_data or sender_data[0] != 'playing':
-        # Исключение для жалобы: даже если игра завершена, жалобу обработать нужно
         if action != "report":
             await callback.message.answer("⚠️ Эта игра уже завершена.")
             return
@@ -705,11 +705,11 @@ async def verify_cat_photo(callback: CallbackQuery):
         cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (callback.from_user.id,))
         my_score = cursor.fetchone()[0]
 
-        await bot.send_message(sender_id, f"🎉 Соперник подтвердил твоего котика! Твой счет в этой игре: {sender_score}")
-        await callback.message.answer(f"✅ Засчитано! У соперника теперь {sender_score} 🐈\nТвой счет: {my_score}")
+        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил твоего котика! Твой счет в этой игре: {sender_score}")
+        await callback.message.answer(f"✅ Засчитано! У собеседника теперь {sender_score} 🐈\nТвой счет: {my_score}")
 
     elif action == "no":
-        await bot.send_message(sender_id, "📸 Соперник отметил твое фото как обычный снимок. Балл за котика не начислен.")
+        await bot.send_message(sender_id, "📸 Собеседник отметил твое фото как обычный снимок. Балл за котика не начислен.")
         await callback.message.answer("Принято! Фото сохранено в истории чата, балл не начислялся.")
 
     elif action == "report":
@@ -718,7 +718,6 @@ async def verify_cat_photo(callback: CallbackQuery):
 
         if MODERATION_CHAT_ID:
             try:
-                # Пересылаем фото в чат модерации с инлайн кнопками
                 await bot.send_photo(
                     MODERATION_CHAT_ID,
                     callback.message.photo[-1].file_id,
@@ -744,14 +743,13 @@ async def handle_chat_and_media(message: Message):
     if not res:
         return
 
-    # Если юзер забанен, просто игнорируем любые его действия
     if res[0] == 'banned':
         return
 
     if res[0] != 'playing':
         if message.photo:
             await message.answer(
-                "❌ Ты не можешь отправлять котиков просто так! Сначала нажми «🔍 Найти игрока» и найди соперника.")
+                "❌ Ты не можешь отправлять котиков просто так! Сначала нажми «🔍 Найти игрока» и найди собеседника.")
         else:
             if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль"]:
                 return
@@ -763,7 +761,7 @@ async def handle_chat_and_media(message: Message):
     if not opponent_id:
         cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
         conn.commit()
-        await message.answer("⚠️ Ошибка: соперник потерян. Пожалуйста, начни поиск заново.", reply_markup=get_main_menu())
+        await message.answer("⚠️ Ошибка: собеседник потерян. Пожалуйста, начни поиск заново.", reply_markup=get_main_menu())
         return
 
     if message.photo:
@@ -776,17 +774,16 @@ async def handle_chat_and_media(message: Message):
                 InlineKeyboardButton(text="📸 Просто фото", callback_data=f"check_cat:no:{user_id}:{file_unique_id}")
             ],
             [
-                # Кнопка ЖАЛОБЫ
                 InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}")
             ]
         ])
 
-        await message.answer("⏳ Отправил фото сопернику на подтверждение...")
+        await message.answer("⏳ Отправил фото собеседнику на подтверждение...")
         
         await bot.send_photo(
             opponent_id, 
             photo.file_id, 
-            caption="<b>[Фото от соперника]</b>\nЭто котик? Подтверди, чтобы ему засчитался балл! 👇", 
+            caption="<b>[Фото от собеседника]</b>\nЭто котик? Подтверди, чтобы ему засчитался балл! 👇", 
             reply_markup=verify_kb,
             parse_mode="HTML"
         )
@@ -796,7 +793,6 @@ async def handle_chat_and_media(message: Message):
         if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль", "🏁 Завершить игру", "🚨 Пожаловаться на собеседника"]:
             return
         
-        # Логируем текстовое сообщение в базу данных для истории жалоб
         cursor.execute("INSERT INTO chat_history (sender_id, receiver_id, text) VALUES (?, ?, ?)", (user_id, opponent_id, message.text))
         conn.commit()
 
