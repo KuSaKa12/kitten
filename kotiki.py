@@ -241,16 +241,41 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # Удаление из базы данных
-    cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-    cursor.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
-    conn.commit()
+    if action == "yes":
+        # 1. Проверяем, находится ли пользователь сейчас в игре
+        cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
+        res = cursor.fetchone()
+        
+        # Если в игре, корректно завершаем сессию для собеседника
+        if res and res[0]:
+            opp_id = res[0]
+            cursor.execute(
+                "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?", 
+                (opp_id,)
+            )
+            try:
+                await callback.bot.send_message(
+                    opp_id, 
+                    "⚠️ Твой собеседник удалил свой профиль. Игра завершена.", 
+                    reply_markup=get_main_menu()
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось отправить уведомление собеседнику {opp_id}: {e}")
 
-    # Сброс состояния (если вдруг пользователь был в процессе регистрации)
-    await state.clear()
+        # 2. Полное удаление данных пользователя из всех таблиц
+        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
+        
+        # Удаляем всю историю переписки, где он был отправителем или получателем
+        cursor.execute("DELETE FROM chat_history WHERE sender_id = ? OR receiver_id = ?", (user_id, user_id))
+        
+        conn.commit()
 
-    await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы бота «котоLOVе». Надеемся еще увидеть тебя!")
-    await callback.answer("Данные удалены.")
+        # 3. Сброс состояния
+        await state.clear()
+
+        await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы бота «котоLOVе». Надеемся еще увидеть тебя!")
+        await callback.answer("Данные удалены.")
 # --- ОБРАБОТЧИКИ КНОПОК МОДЕРАЦИИ (INLINE) ---
 @router.callback_query(F.data.startswith("mod_ban:"))
 async def mod_ban_handler(callback: CallbackQuery):
@@ -284,17 +309,6 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
     await state.set_state(Registration.waiting_for_age)
 
 
-@router.message(F.text == "/debug_data")
-async def debug_data(message: Message):
-    cursor.execute("SELECT user_id, username, total_cats FROM users")
-    all_users = cursor.fetchall()
-    if not all_users:
-        await message.answer("БД пуста!")
-    else:
-        text = "Данные в БД:\n"
-        for u in all_users:
-            text += f"ID: {u[0]} | Name: {u[1]} | Cats: {u[2]}\n"
-        await message.answer(text)
 
 
 # --- СИСТЕМА ОБЫЧНЫХ РЕПОРТОВ (БАГИ, ПРЕДЛОЖЕНИЯ РАЗРАБУ) ---
@@ -365,15 +379,20 @@ async def cmd_start(message: Message, state: FSMContext):
         return
 
     rules_text = (
-        "🐾 Добро пожаловать в сервис «котоLOVе»!\n\n"
-        "Этот бот создан для знакомств, общения и поиска друзей! Общайтесь, делитесь эмоциями и радуйте друг друга фото ваших питомцев!\n\n"
-        "⚠️ Чтобы сервис оставался безопасным и приятным для всех, соблюдай правила:\n\n"
-        "1️⃣ <b>Будь честен</b>: Используй только свои фото. Никакого контента из интернета!\n"
-        "2️⃣ <b>Запрет 18+</b>: Строго запрещен любой непристойный, эротический или порнографический контент. Нарушение = вечный бан.\n"
-        "3️⃣ <b>Мошенничество</b>: Запрещены любые попытки выманивания денег, личных данных или обмана пользователей. Нарушение = вечный бан.\n"
-        "4️⃣ <b>Уважение</b>: Никакой токсичности, травли, оскорблений или спама. Собеседник — тоже человек!\n"
-        "5️⃣ <b>Разнообразие</b>: Один ракурс — один котик. Не спамь одним и тем же снимком.\n\n"
-        "Нажимая кнопку ниже, ты подтверждаешь, что ознакомился с <a href='ССЫЛКА_НА_СОГЛАШЕНИЕ'>Пользовательским соглашением</a> и <a href='ССЫЛКА_НА_ПОЛИТИКУ'>Политикой конфиденциальности</a>, а также готов соблюдать правила сервиса! 🐱"
+        "🐾 <b>Добро пожаловать в «котоLOVе»!</b>\n"
+        "<i>Твой уютный уголок для знакомств, общения и поиска друзей через любовь к хвостикам.</i> 🐈\n\n"
+        "Чтобы наше комьюнити оставалось безопасным и ламповым, пожалуйста, соблюдай эти простые правила:\n\n"
+        "📸 <b>1. Только свои котики</b>\n"
+        "Используй исключительно реальные фото своих питомцев. Картинкам из интернета здесь не место!\n\n"
+        "🔞 <b>2. Строго без 18+</b>\n"
+        "Запрещен любой непристойный, эротический или порнографический контент. <i>Нарушение = вечный бан.</i>\n\n"
+        "🛡 <b>3. Честность и безопасность</b>\n"
+        "Никакого мошенничества, спама и попыток выманивания личных данных или денег. <i>Нарушение = вечный бан.</i>\n\n"
+        "💌 <b>4. Взаимное уважение</b>\n"
+        "Мы за позитив! Токсичность, травля и оскорбления недопустимы. Собеседник — тоже человек.\n\n"
+        "🌟 <b>5. Больше разнообразия</b>\n"
+        "Один ракурс — один котик. Не спамь одним и тем же снимком, покажи пушистого во всей красе!\n\n"
+        "👇 <i>Нажимая кнопку ниже, ты подтверждаешь, что принимаешь <a href='ССЫЛКА_НА_СОГЛАШЕНИЕ'>Пользовательское соглашение</a> и <a href='ССЫЛКА_НА_ПОЛИТИКУ'>Политику конфиденциальности</a>, и готов(а) соблюдать правила сервиса!</i>"
     )
     await message.answer(
         rules_text, 
