@@ -4,6 +4,7 @@ import asyncio
 import os
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, \
@@ -28,7 +29,10 @@ if sys.platform == 'win32':
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов и админ-панели
+ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов (баги/предложения)
+# ID чата модерации (группы), куда будут приходить жалобы на игроков. 
+# Если не указан, упадет в личку ADMIN_ID
+MODERATION_CHAT_ID = os.getenv("MODERATION_CHAT_ID", ADMIN_ID) 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -53,11 +57,24 @@ CREATE TABLE IF NOT EXISTS users (
     total_cats INTEGER DEFAULT 0,         
     current_opponent INTEGER DEFAULT NULL
 )''')
+
+# Таблица фото
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS cat_photos (
     file_unique_id TEXT PRIMARY KEY,
     user_id INTEGER
 )''')
+
+# Таблица логов чата для модерации (последние сообщения)
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER,
+    receiver_id INTEGER,
+    text TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)''')
+
 conn.commit()
 
 
@@ -100,9 +117,15 @@ def get_main_menu():
         [KeyboardButton(text="⚙️ Изменить профиль"), KeyboardButton(text="🏆 Таблица лидеров")]
     ], resize_keyboard=True)
 
+def get_search_menu():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🛑 Остановить поиск")]
+    ], resize_keyboard=True)
+
 def get_game_menu():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🏁 Завершить игру")]
+        [KeyboardButton(text="🏁 Завершить игру")],
+        [KeyboardButton(text="🚨 Пожаловаться на собеседника")]
     ], resize_keyboard=True)
 
 def get_confirm_inline_kb():
@@ -110,6 +133,15 @@ def get_confirm_inline_kb():
         [
             InlineKeyboardButton(text="✅ Да, выйти", callback_data="confirm_exit_yes"),
             InlineKeyboardButton(text="❌ Нет, играем дальше", callback_data="confirm_exit_no")
+        ]
+    ])
+
+# Клавиатура для модерации жалоб
+def get_moderation_kb(target_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔨 Забанить", callback_data=f"mod_ban:{target_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_dismiss:{target_id}")
         ]
     ])
 
@@ -125,7 +157,7 @@ async def check_subscription(user_id: int) -> bool:
         return True 
 
 
-# --- АДМИН ПАНЕЛЬ: БАН И РАЗБАН ---
+# --- АДМИН ПАНЕЛЬ: БАН (Ручная команда) ---
 @router.message(Command("ban"))
 async def cmd_ban(message: Message, command: CommandObject):
     if str(message.from_user.id) != str(ADMIN_ID):
@@ -141,6 +173,10 @@ async def cmd_ban(message: Message, command: CommandObject):
         await message.answer("❌ ID должен быть числом.")
         return
 
+    await perform_ban(target_id)
+    await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
+
+async def perform_ban(target_id: int):
     # Проверяем, находится ли нарушитель сейчас в игре
     cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,))
     res = cursor.fetchone()
@@ -166,13 +202,36 @@ async def cmd_ban(message: Message, command: CommandObject):
     try:
         await bot.send_message(
             target_id,
-            "⛔️ <b>Вы были навсегда заблокированы администратором за нарушение правил.</b>",
+            "⛔️ <b>Вы были навсегда заблокированы администратором/модератором за нарушение правил.</b>",
             parse_mode="HTML"
         )
     except Exception as e:
         logging.warning(f"Не удалось отправить сообщение о бане пользователю {target_id}: {e}")
 
-    await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
+
+# --- ОБРАБОТЧИКИ КНОПОК МОДЕРАЦИИ (INLINE) ---
+@router.callback_query(F.data.startswith("mod_ban:"))
+async def mod_ban_handler(callback: CallbackQuery):
+    target_id = int(callback.data.split(":")[1])
+    await perform_ban(target_id)
+    
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(f"🔨 <b>Решение принято:</b> Пользователь <code>{target_id}</code> ЗАБАНЕН.", parse_mode="HTML")
+    except:
+        pass
+    await callback.answer("Пользователь заблокирован.")
+
+@router.callback_query(F.data.startswith("mod_dismiss:"))
+async def mod_dismiss_handler(callback: CallbackQuery):
+    target_id = int(callback.data.split(":")[1])
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(f"❌ <b>Решение принято:</b> Жалоба на пользователя <code>{target_id}</code> ОТКЛОНЕНА.", parse_mode="HTML")
+    except:
+        pass
+    await callback.answer("Жалоба отклонена.")
+
 
 # --- ФУНКЦИЯ СТАРТА РЕГИСТРАЦИИ ---
 async def start_registration_flow(message: Message, state: FSMContext, text_prefix=""):
@@ -196,77 +255,43 @@ async def debug_data(message: Message):
         await message.answer(text)
 
 
-# --- СИСТЕМА РЕПОРТОВ ---
+# --- СИСТЕМА ОБЫЧНЫХ РЕПОРТОВ (БАГИ, ПРЕДЛОЖЕНИЯ РАЗРАБУ) ---
 @router.message(Command("report"))
 async def cmd_report(message: Message, state: FSMContext):
-    # Проверка на бан
     cursor.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,))
     res = cursor.fetchone()
     if res and res[0] == 'banned':
         return
 
-    # Немного изменил текст, чтобы юзер знал, что можно кидать фото
     await message.answer("📝 Напиши своё предложение или баг-репорт (можно прикрепить скриншот) <b>одним сообщением</b>, и я передам его создателю бота!", parse_mode="HTML")
     await state.set_state(ReportState.waiting_for_text)
 
-
-# Ловим и текст, и фото (aiogram по умолчанию поймает всё в нужном состоянии)
 @router.message(ReportState.waiting_for_text)
 async def process_report(message: Message, state: FSMContext):
     user_id = message.from_user.id
     
-    # Получаем ID оппонента (если он был), чтобы легче было банить нарушителей
     cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
     opp_id_text = f"Последний оппонент ID: <code>{res[0]}</code>" if res and res[0] else "Оппонента нет"
 
     user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{user_id}</code>)\n{opp_id_text}"
-    
-    # Берем message.text, если это обычное сообщение. 
-    # Если это фото, берем message.caption.
-    # Если прислали фото без подписи, ставим заглушку "Без текста".
     report_text = message.text or message.caption or "<i>Без текста</i>"
     
     if ADMIN_ID:
         try:
             if message.photo:
-                # Если юзер прикрепил фото, отправляем его через send_photo
                 await bot.send_photo(
                     ADMIN_ID, 
-                    message.photo[-1].file_id, # Берем фото в лучшем качестве
+                    message.photo[-1].file_id, 
                     caption=f"🔔 <b>Новый отзыв/репорт (с фото)!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
                     parse_mode="HTML"
                 )
             else:
-                # Если фото нет, просто отправляем текст
                 await bot.send_message(
                     ADMIN_ID, 
                     f"🔔 <b>Новый отзыв/репорт!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
                     parse_mode="HTML"
                 )
-            await message.answer("✅ Спасибо! Твой отзыв успешно отправлен разработчику.")
-        except Exception as e:
-            logging.error(f"Ошибка отправки репорта админу: {e}")
-            await message.answer("❌ Произошла ошибка при отправке. Попробуй позже.")
-    else:
-        await message.answer("❌ Администратор бота временно недоступен, но твой репорт принят в космос!")
-    
-    await state.clear()
-    
-    # Получаем ID оппонента (если он был), чтобы легче было банить нарушителей
-    cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-    opp_id_text = f"Последний оппонент ID: <code>{res[0]}</code>" if res and res[0] else "Оппонента нет"
-
-    user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{user_id}</code>)\n{opp_id_text}"
-    
-    if ADMIN_ID:
-        try:
-            await bot.send_message(
-                ADMIN_ID, 
-                f"🔔 <b>Новый отзыв/репорт!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
-                parse_mode="HTML"
-            )
             await message.answer("✅ Спасибо! Твой отзыв успешно отправлен разработчику.")
         except Exception as e:
             logging.error(f"Ошибка отправки репорта админу: {e}")
@@ -285,7 +310,6 @@ async def cmd_start(message: Message, state: FSMContext):
     cursor.execute("SELECT age_category, status FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
 
-    # Игнорируем забаненных
     if res and res[1] == 'banned':
         await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
         return
@@ -305,7 +329,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "1️⃣ Будь честен: Не используй фото из интернета. Мы здесь, чтобы делиться живыми эмоциями!\n"
         "2️⃣ Свежие фото: Присылай снимки, которые сделал сам прямо сейчас.\n"
         "3️⃣ Разнообразие: Не спамь одним и тем же котиком 100 раз. Один ракурс — один котик!\n"
-        "4️⃣ Запрещенный контент: За отправку непристойных фото или спама — вечный бан.\n\n"
+        "4️⃣ Запрещенный контент: За отправку непристойных фото или токсичное общение — вечный бан.\n\n"
         "Нажимая кнопку ниже, ты подтверждаешь, что готов играть честно! 🐱"
     )
     await message.answer(
@@ -467,7 +491,22 @@ async def find_player(message: Message, state: FSMContext):
     else:
         cursor.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
         conn.commit()
-        await message.answer("🔍 Ищем соперника... Пожалуйста, подожди.")
+        await message.answer("🔍 Ищем соперника... Пожалуйста, подожди.", reply_markup=get_search_menu())
+
+
+# --- ОСТАНОВКА ПОИСКА ---
+@router.message(F.text == "🛑 Остановить поиск")
+async def stop_search(message: Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+
+    if res and res[0] == 'searching':
+        cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
+        conn.commit()
+        await message.answer("🛑 Поиск отменен.", reply_markup=get_main_menu())
+    else:
+        await message.answer("Вы сейчас не в поиске.", reply_markup=get_main_menu())
 
 
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ ---
@@ -487,6 +526,66 @@ async def ask_end_game(message: Message):
         return
     else:
         await message.answer("Ты сейчас не в игре.", reply_markup=get_main_menu())
+
+
+# --- ЖАЛОБА НА СОБЕСЕДНИКА ВО ВРЕМЯ ИГРЫ (ТОКСИЧНОСТЬ) ---
+@router.message(F.text == "🚨 Пожаловаться на собеседника")
+async def report_player_chat(message: Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+
+    if not res or res[0] != 'playing':
+        return await message.answer("Эта функция доступна только во время игры.")
+
+    opponent_id = res[1]
+    
+    if not MODERATION_CHAT_ID:
+        return await message.answer("❌ Сервер модерации временно недоступен.")
+
+    # Получаем историю сообщений за последние 20 минут между этими двумя игроками
+    time_limit = (datetime.now() - timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
+    
+    cursor.execute("""
+        SELECT sender_id, text, timestamp FROM chat_history
+        WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+          AND timestamp >= ?
+        ORDER BY timestamp ASC
+    """, (user_id, opponent_id, opponent_id, user_id, time_limit))
+    
+    history = cursor.fetchall()
+    
+    history_text = ""
+    for sender, txt, ts in history:
+        # Упрощаем отображение времени и того, кто пишет
+        name = "Нарушитель" if sender == opponent_id else "Жалующийся"
+        time_str = ts.split(" ")[1] if " " in ts else ts
+        history_text += f"[{time_str}] {name}: {txt}\n"
+
+    if not history_text:
+        history_text = "<i>Сообщений за последние 20 минут в текстовом виде нет.</i>"
+    elif len(history_text) > 3000:
+        history_text = history_text[-3000:] # Обрезаем, если история слишком большая для одного сообщения
+
+    report_msg = (
+        f"🚨 <b>ЖАЛОБА НА ОБЩЕНИЕ (Токсичность / Спам)</b>\n\n"
+        f"Нарушитель ID: <code>{opponent_id}</code>\n"
+        f"Жалуется ID: <code>{user_id}</code>\n\n"
+        f"<b>История чата за последние 20 минут:</b>\n"
+        f"{history_text}"
+    )
+
+    try:
+        await bot.send_message(
+            MODERATION_CHAT_ID,
+            report_msg,
+            reply_markup=get_moderation_kb(opponent_id),
+            parse_mode="HTML"
+        )
+        await message.answer("🚨 Твоя жалоба и история чата успешно отправлены модераторам. Спасибо!")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке логов чата модераторам: {e}")
+        await message.answer("❌ Произошла ошибка при отправке репорта.")
 
 
 # --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА ---
@@ -564,7 +663,7 @@ async def show_leaderboard(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
-# --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ) ---
+# --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
 @router.callback_query(F.data.startswith("check_cat:"))
 async def verify_cat_photo(callback: CallbackQuery):
     data_parts = callback.data.split(":")
@@ -617,19 +716,18 @@ async def verify_cat_photo(callback: CallbackQuery):
         await bot.send_message(sender_id, "⚠️ На ваше фото поступила жалоба. Ожидайте решения модератора.")
         await callback.message.answer("🚨 Жалоба успешно отправлена администратору. Спасибо за бдительность!")
 
-        if ADMIN_ID:
+        if MODERATION_CHAT_ID:
             try:
-                # Пересылаем фото админу (оно есть в callback.message)
+                # Пересылаем фото в чат модерации с инлайн кнопками
                 await bot.send_photo(
-                    ADMIN_ID,
+                    MODERATION_CHAT_ID,
                     callback.message.photo[-1].file_id,
                     caption=(
-                        f"🚨 <b>ЖАЛОБА НА ФОТО</b>\n"
-                        f"Отправитель (Нарушитель) ID: <code>{sender_id}</code>\n"
-                        f"Жалуется ID: {callback.from_user.id}\n\n"
-                        f"Для мгновенной блокировки скопируйте и отправьте команду:\n"
-                        f"<code>/ban {sender_id}</code>"
+                        f"🚨 <b>ЖАЛОБА НА ФОТО (НСФВ/Спам)</b>\n"
+                        f"Нарушитель ID: <code>{sender_id}</code>\n"
+                        f"Жалуется ID: <code>{callback.from_user.id}</code>\n"
                     ),
+                    reply_markup=get_moderation_kb(sender_id),
                     parse_mode="HTML"
                 )
             except Exception as e:
@@ -678,7 +776,7 @@ async def handle_chat_and_media(message: Message):
                 InlineKeyboardButton(text="📸 Просто фото", callback_data=f"check_cat:no:{user_id}:{file_unique_id}")
             ],
             [
-                # Новая кнопка ЖАЛОБЫ
+                # Кнопка ЖАЛОБЫ
                 InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}")
             ]
         ])
@@ -695,8 +793,13 @@ async def handle_chat_and_media(message: Message):
         return
 
     if message.text:
-        if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль", "🏁 Завершить игру"]:
+        if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль", "🏁 Завершить игру", "🚨 Пожаловаться на собеседника"]:
             return
+        
+        # Логируем текстовое сообщение в базу данных для истории жалоб
+        cursor.execute("INSERT INTO chat_history (sender_id, receiver_id, text) VALUES (?, ?, ?)", (user_id, opponent_id, message.text))
+        conn.commit()
+
         try:
             await bot.send_message(opponent_id, message.text)
         except Exception:
