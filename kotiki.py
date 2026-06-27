@@ -161,27 +161,18 @@ async def cmd_ban(message: Message, command: CommandObject):
     # Выдаем бан
     cursor.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
     conn.commit()
-    await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
 
-
-@router.message(Command("unban"))
-async def cmd_unban(message: Message, command: CommandObject):
-    if str(message.from_user.id) != str(ADMIN_ID):
-        return
-
-    if not command.args:
-        await message.answer("⚠️ Использование: /unban <ID_пользователя>")
-        return
-    
+    # Уведомляем самого нарушителя
     try:
-        target_id = int(command.args)
-    except ValueError:
-        return
+        await bot.send_message(
+            target_id,
+            "⛔️ <b>Вы были навсегда заблокированы администратором за нарушение правил.</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить сообщение о бане пользователю {target_id}: {e}")
 
-    cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (target_id,))
-    conn.commit()
-    await message.answer(f"✅ Пользователь <code>{target_id}</code> разблокирован.", parse_mode="HTML")
-
+    await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
 
 # --- ФУНКЦИЯ СТАРТА РЕГИСТРАЦИИ ---
 async def start_registration_flow(message: Message, state: FSMContext, text_prefix=""):
@@ -214,14 +205,53 @@ async def cmd_report(message: Message, state: FSMContext):
     if res and res[0] == 'banned':
         return
 
-    await message.answer("📝 Напиши своё предложение или баг-репорт <b>одним сообщением</b>, и я передам его создателю бота!", parse_mode="HTML")
+    # Немного изменил текст, чтобы юзер знал, что можно кидать фото
+    await message.answer("📝 Напиши своё предложение или баг-репорт (можно прикрепить скриншот) <b>одним сообщением</b>, и я передам его создателю бота!", parse_mode="HTML")
     await state.set_state(ReportState.waiting_for_text)
 
 
+# Ловим и текст, и фото (aiogram по умолчанию поймает всё в нужном состоянии)
 @router.message(ReportState.waiting_for_text)
 async def process_report(message: Message, state: FSMContext):
-    report_text = message.text
     user_id = message.from_user.id
+    
+    # Получаем ID оппонента (если он был), чтобы легче было банить нарушителей
+    cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    opp_id_text = f"Последний оппонент ID: <code>{res[0]}</code>" if res and res[0] else "Оппонента нет"
+
+    user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{user_id}</code>)\n{opp_id_text}"
+    
+    # Берем message.text, если это обычное сообщение. 
+    # Если это фото, берем message.caption.
+    # Если прислали фото без подписи, ставим заглушку "Без текста".
+    report_text = message.text or message.caption or "<i>Без текста</i>"
+    
+    if ADMIN_ID:
+        try:
+            if message.photo:
+                # Если юзер прикрепил фото, отправляем его через send_photo
+                await bot.send_photo(
+                    ADMIN_ID, 
+                    message.photo[-1].file_id, # Берем фото в лучшем качестве
+                    caption=f"🔔 <b>Новый отзыв/репорт (с фото)!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
+                    parse_mode="HTML"
+                )
+            else:
+                # Если фото нет, просто отправляем текст
+                await bot.send_message(
+                    ADMIN_ID, 
+                    f"🔔 <b>Новый отзыв/репорт!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
+                    parse_mode="HTML"
+                )
+            await message.answer("✅ Спасибо! Твой отзыв успешно отправлен разработчику.")
+        except Exception as e:
+            logging.error(f"Ошибка отправки репорта админу: {e}")
+            await message.answer("❌ Произошла ошибка при отправке. Попробуй позже.")
+    else:
+        await message.answer("❌ Администратор бота временно недоступен, но твой репорт принят в космос!")
+    
+    await state.clear()
     
     # Получаем ID оппонента (если он был), чтобы легче было банить нарушителей
     cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
