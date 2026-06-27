@@ -89,6 +89,14 @@ class ReportState(StatesGroup):
 
 
 # --- КЛАВИАТУРЫ ---
+def get_delete_confirm_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗑 Да, удалить всё", callback_data="delete_confirm_yes"),
+            InlineKeyboardButton(text="❌ Нет, отмена", callback_data="delete_confirm_no")
+        ]
+    ])
+    
 def get_age_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Меньше 12 лет"), KeyboardButton(text="12 - 14 лет")],
@@ -209,6 +217,40 @@ async def perform_ban(target_id: int):
         logging.warning(f"Не удалось отправить сообщение о бане пользователю {target_id}: {e}")
 
 
+
+# Команда для удаления данных
+@router.message(Command("delete_data"))
+async def cmd_delete_data(message: Message):
+    await message.answer(
+        "⚠️ <b>ВНИМАНИЕ!</b>\n"
+        "Ты собираешься удалить все данные о себе из базы данных бота «котоLOVе».\n\n"
+        "Это действие <b>необратимо</b>: твой профиль, счетчик котов и вся статистика будут стерты навсегда. "
+        "Ты уверен, что хочешь продолжить?",
+        reply_markup=get_delete_confirm_kb(),
+        parse_mode="HTML"
+    )
+
+# Обработка нажатия на кнопки удаления
+@router.callback_query(F.data.startswith("delete_confirm_"))
+async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    action = callback.data.split("_")[-1]
+
+    if action == "no":
+        await callback.message.edit_text("✅ Отмена. Твои данные остались в безопасности.")
+        await callback.answer()
+        return
+
+    # Удаление из базы данных
+    cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+    # Сброс состояния (если вдруг пользователь был в процессе регистрации)
+    await state.clear()
+
+    await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы бота «котоLOVе». Надеемся еще увидеть тебя!")
+    await callback.answer("Данные удалены.")
 # --- ОБРАБОТЧИКИ КНОПОК МОДЕРАЦИИ (INLINE) ---
 @router.callback_query(F.data.startswith("mod_ban:"))
 async def mod_ban_handler(callback: CallbackQuery):
