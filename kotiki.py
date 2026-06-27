@@ -1,3 +1,4 @@
+
 import socket
 import sys
 import asyncio
@@ -242,17 +243,57 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
         return
 
     if action == "yes":
-        # 1. Проверяем, находится ли пользователь сейчас в игре
+        # 1. Получаем ID оппонента ДО начала удаления
         cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
         res = cursor.fetchone()
+        opp_id = res[0] if res and res[0] else None
+
+        # 2. Безопасная транзакция в БД
+        try:
+            # Начинаем транзакцию (в sqlite3 python она часто стартует автоматически при DML, 
+            # но мы задаем жесткие рамки)
+            conn.execute("BEGIN TRANSACTION")
+
+            # Если пользователь в игре, освобождаем оппонента
+            if opp_id:
+                cursor.execute(
+                    "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?", 
+                    (opp_id,)
+                )
+
+            # Удаляем данные пользователя
+            cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
+            
+            # Удаляем ТОЛЬКО сообщения, отправленные самим пользователем
+            # (Чужие сообщения, где он был получателем, остаются)
+            cursor.execute("DELETE FROM chat_history WHERE sender_id = ?", (user_id,))
+
+            # Фиксируем изменения
+            conn.commit()
+            logging.info(f"[DELETE] Данные пользователя {user_id} успешно удалены.")
+
+        except sqlite3.Error as db_err:
+            # Если что-то пошло не так (например, lock базы или ошибка ключей) — откатываем ВСЁ
+            conn.rollback()
+            logging.error(f"[DELETE ERROR] Ошибка БД при удалении пользователя {user_id}: {db_err}")
+            await callback.message.edit_text("❌ Произошла ошибка базы данных. Попробуй позже или обратись в поддержку.")
+            await callback.answer()
+            return
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"[DELETE ERROR] Непредвиденная ошибка при удалении {user_id}: {e}")
+            await callback.message.edit_text("❌ Произошла непредвиденная ошибка сервера.")
+            await callback.answer()
+            return
+
+        # 3. Очищаем машину состояний (выполняется только если БД отработала успешно)
+        await state.clear()
+
+        # 4. Взаимодействие с Telegram API (вынесено отдельно, чтобы ошибки сети не ломали БД)
         
-        # Если в игре, корректно завершаем сессию для собеседника
-        if res and res[0]:
-            opp_id = res[0]
-            cursor.execute(
-                "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?", 
-                (opp_id,)
-            )
+        # Уведомляем оппонента
+        if opp_id:
             try:
                 await callback.bot.send_message(
                     opp_id, 
@@ -260,21 +301,15 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
                     reply_markup=get_main_menu()
                 )
             except Exception as e:
-                logging.warning(f"Не удалось отправить уведомление собеседнику {opp_id}: {e}")
+                # Если оппонент заблокировал бота, просто логируем и идем дальше
+                logging.info(f"Не удалось отправить уведомление оппоненту {opp_id} (вероятно, бот заблокирован): {e}")
 
-        # 2. Полное удаление данных пользователя из всех таблиц
-        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-        cursor.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
-        
-        # Удаляем всю историю переписки, где он был отправителем или получателем
-        cursor.execute("DELETE FROM chat_history WHERE sender_id = ? OR receiver_id = ?", (user_id, user_id))
-        
-        conn.commit()
-
-        # 3. Сброс состояния
-        await state.clear()
-
-        await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы бота «котоLOVе». Надеемся еще увидеть тебя!")
+        # Уведомляем самого пользователя
+        try:
+            await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы. Надеемся еще увидеть тебя!")
+        except Exception:
+            pass  # Если сообщение уже устарело, игнорируем
+            
         await callback.answer("Данные удалены.")
 # --- ОБРАБОТЧИКИ КНОПОК МОДЕРАЦИИ (INLINE) ---
 @router.callback_query(F.data.startswith("mod_ban:"))
@@ -533,26 +568,35 @@ async def find_player(message: Message, state: FSMContext):
         return
 
     query = """
-        SELECT user_id FROM users 
-        WHERE status = 'searching' 
-          AND user_id != ? 
-          AND (target_gender = 'any' OR target_gender = ?)
-          AND (? = 'any' OR gender = ?)
-        LIMIT 1
+        UPDATE users 
+        SET status = 'playing', current_opponent = ?, current_match_cats = 0
+        WHERE user_id = (
+            SELECT user_id FROM users 
+            WHERE status = 'searching' 
+              AND user_id != ? 
+              AND (target_gender = 'any' OR target_gender = ?)
+              AND (? = 'any' OR gender = ?)
+            LIMIT 1
+        )
+        RETURNING user_id
     """
-    cursor.execute(query, (user_id, u_gender, u_target, u_target))
+    cursor.execute(query, (user_id, user_id, u_gender, u_target, u_target))
     opponent = cursor.fetchone()
 
     if opponent:
         opponent_id = opponent[0]
         
-        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (opponent_id, user_id))
-        cursor.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (user_id, opponent_id))
+        # Теперь обновляем статус самого искателя
+        cursor.execute(
+            "UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", 
+            (opponent_id, user_id)
+        )
         conn.commit()
 
         await message.answer("🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
         await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
     else:
+        # Если никого нет, встаем в поиск
         cursor.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
         conn.commit()
         await message.answer("🔍 Ищем собеседника... Пожалуйста, подожди.", reply_markup=get_search_menu())
