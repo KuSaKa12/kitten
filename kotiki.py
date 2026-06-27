@@ -4,12 +4,11 @@ import asyncio
 import os
 import logging
 import sqlite3
-
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, \
     InlineKeyboardButton, CallbackQuery
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -29,7 +28,7 @@ if sys.platform == 'win32':
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов
+ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов и админ-панели
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -79,18 +78,15 @@ def get_age_kb():
         [KeyboardButton(text="13 - 15 лет"), KeyboardButton(text="16 лет и старше")]
     ], resize_keyboard=True, one_time_keyboard=True)
 
-
 def get_rules_inline_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Я ознакомился, начать!", callback_data="start_registration")]
     ])
 
-
 def get_gender_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Парень"), KeyboardButton(text="Девушка")]
     ], resize_keyboard=True, one_time_keyboard=True)
-
 
 def get_target_gender_kb():
     return ReplyKeyboardMarkup(keyboard=[
@@ -98,19 +94,16 @@ def get_target_gender_kb():
         [KeyboardButton(text="Всё равно")]
     ], resize_keyboard=True, one_time_keyboard=True)
 
-
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🔍 Найти игрока")],
         [KeyboardButton(text="⚙️ Изменить профиль"), KeyboardButton(text="🏆 Таблица лидеров")]
     ], resize_keyboard=True)
 
-
 def get_game_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🏁 Завершить игру")]
     ], resize_keyboard=True)
-
 
 def get_confirm_inline_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -128,8 +121,66 @@ async def check_subscription(user_id: int) -> bool:
             return True
         return False
     except Exception as e:
-        logging.error(f"Ошибка проверки подписки (возможно бот не админ): {e}")
+        logging.error(f"Ошибка проверки подписки: {e}")
         return True 
+
+
+# --- АДМИН ПАНЕЛЬ: БАН И РАЗБАН ---
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+
+    if not command.args:
+        await message.answer("⚠️ Использование: /ban <ID_пользователя>\nНапример: /ban 123456789")
+        return
+    
+    try:
+        target_id = int(command.args)
+    except ValueError:
+        await message.answer("❌ ID должен быть числом.")
+        return
+
+    # Проверяем, находится ли нарушитель сейчас в игре
+    cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,))
+    res = cursor.fetchone()
+    
+    # Если он в игре, завершаем игру для соперника
+    if res and res[0]:
+        opp_id = res[0]
+        cursor.execute("UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?", (opp_id,))
+        try:
+            await bot.send_message(
+                opp_id, 
+                "🚨 Твой соперник был заблокирован администратором за нарушение правил. Игра завершена.", 
+                reply_markup=get_main_menu()
+            )
+        except:
+            pass
+
+    # Выдаем бан
+    cursor.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
+    conn.commit()
+    await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+
+    if not command.args:
+        await message.answer("⚠️ Использование: /unban <ID_пользователя>")
+        return
+    
+    try:
+        target_id = int(command.args)
+    except ValueError:
+        return
+
+    cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (target_id,))
+    conn.commit()
+    await message.answer(f"✅ Пользователь <code>{target_id}</code> разблокирован.", parse_mode="HTML")
 
 
 # --- ФУНКЦИЯ СТАРТА РЕГИСТРАЦИИ ---
@@ -157,19 +208,33 @@ async def debug_data(message: Message):
 # --- СИСТЕМА РЕПОРТОВ ---
 @router.message(Command("report"))
 async def cmd_report(message: Message, state: FSMContext):
+    # Проверка на бан
+    cursor.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,))
+    res = cursor.fetchone()
+    if res and res[0] == 'banned':
+        return
+
     await message.answer("📝 Напиши своё предложение или баг-репорт <b>одним сообщением</b>, и я передам его создателю бота!", parse_mode="HTML")
     await state.set_state(ReportState.waiting_for_text)
+
 
 @router.message(ReportState.waiting_for_text)
 async def process_report(message: Message, state: FSMContext):
     report_text = message.text
-    user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: {message.from_user.id})"
+    user_id = message.from_user.id
+    
+    # Получаем ID оппонента (если он был), чтобы легче было банить нарушителей
+    cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    opp_id_text = f"Последний оппонент ID: <code>{res[0]}</code>" if res and res[0] else "Оппонента нет"
+
+    user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{user_id}</code>)\n{opp_id_text}"
     
     if ADMIN_ID:
         try:
             await bot.send_message(
                 ADMIN_ID, 
-                f"🔔 <b>Новый отзыв по КотоLOVe!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
+                f"🔔 <b>Новый отзыв/репорт!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
                 parse_mode="HTML"
             )
             await message.answer("✅ Спасибо! Твой отзыв успешно отправлен разработчику.")
@@ -187,8 +252,13 @@ async def process_report(message: Message, state: FSMContext):
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    cursor.execute("SELECT age_category FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT age_category, status FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
+
+    # Игнорируем забаненных
+    if res and res[1] == 'banned':
+        await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
+        return
 
     if res and res[0] is not None:
         cursor.execute(
@@ -205,7 +275,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "1️⃣ Будь честен: Не используй фото из интернета. Мы здесь, чтобы делиться живыми эмоциями!\n"
         "2️⃣ Свежие фото: Присылай снимки, которые сделал сам прямо сейчас.\n"
         "3️⃣ Разнообразие: Не спамь одним и тем же котиком 100 раз. Один ракурс — один котик!\n"
-        "4️⃣ Только котики: Отправляй в чат только фотографии кошек.\n\n"
+        "4️⃣ Запрещенный контент: За отправку непристойных фото или спама — вечный бан.\n\n"
         "Нажимая кнопку ниже, ты подтверждаешь, что готов играть честно! 🐱"
     )
     await message.answer(
@@ -225,6 +295,10 @@ async def change_profile(message: Message, state: FSMContext):
 
     if not res:
         await cmd_start(message, state)
+        return
+
+    if res[0] == 'banned':
+        await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
         return
 
     if res[0] == 'playing':
@@ -332,6 +406,10 @@ async def find_player(message: Message, state: FSMContext):
 
     current_status, u_gender, u_target = u_data
 
+    if current_status == 'banned':
+        await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
+        return
+
     if current_status == 'playing':
         await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
         return
@@ -375,6 +453,8 @@ async def ask_end_game(message: Message):
             "Твой счётчик котов в этой игре сбросится!",
             reply_markup=get_confirm_inline_kb()
         )
+    elif res and res[0] == 'banned':
+        return
     else:
         await message.answer("Ты сейчас не в игре.", reply_markup=get_main_menu())
 
@@ -428,6 +508,11 @@ async def process_confirm_exit(callback: CallbackQuery):
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
+    cursor.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,))
+    res = cursor.fetchone()
+    if res and res[0] == 'banned':
+        return
+
     cursor.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10")
     leaders = cursor.fetchall()
     
@@ -449,7 +534,7 @@ async def show_leaderboard(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
-# --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ ---
+# --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ) ---
 @router.callback_query(F.data.startswith("check_cat:"))
 async def verify_cat_photo(callback: CallbackQuery):
     data_parts = callback.data.split(":")
@@ -467,8 +552,10 @@ async def verify_cat_photo(callback: CallbackQuery):
     cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (sender_id,))
     sender_data = cursor.fetchone()
     if not sender_data or sender_data[0] != 'playing':
-        await callback.message.answer("⚠️ Эта игра уже завершена.")
-        return
+        # Исключение для жалобы: даже если игра завершена, жалобу обработать нужно
+        if action != "report":
+            await callback.message.answer("⚠️ Эта игра уже завершена.")
+            return
 
     if action == "yes":
         cursor.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,))
@@ -496,6 +583,28 @@ async def verify_cat_photo(callback: CallbackQuery):
         await bot.send_message(sender_id, "📸 Соперник отметил твое фото как обычный снимок. Балл за котика не начислен.")
         await callback.message.answer("Принято! Фото сохранено в истории чата, балл не начислялся.")
 
+    elif action == "report":
+        await bot.send_message(sender_id, "⚠️ На ваше фото поступила жалоба. Ожидайте решения модератора.")
+        await callback.message.answer("🚨 Жалоба успешно отправлена администратору. Спасибо за бдительность!")
+
+        if ADMIN_ID:
+            try:
+                # Пересылаем фото админу (оно есть в callback.message)
+                await bot.send_photo(
+                    ADMIN_ID,
+                    callback.message.photo[-1].file_id,
+                    caption=(
+                        f"🚨 <b>ЖАЛОБА НА ФОТО</b>\n"
+                        f"Отправитель (Нарушитель) ID: <code>{sender_id}</code>\n"
+                        f"Жалуется ID: {callback.from_user.id}\n\n"
+                        f"Для мгновенной блокировки скопируйте и отправьте команду:\n"
+                        f"<code>/ban {sender_id}</code>"
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logging.error(f"Ошибка отправки жалобы на фото: {e}")
+
 
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
 @router.message()
@@ -505,6 +614,10 @@ async def handle_chat_and_media(message: Message):
     res = cursor.fetchone()
 
     if not res:
+        return
+
+    # Если юзер забанен, просто игнорируем любые его действия
+    if res[0] == 'banned':
         return
 
     if res[0] != 'playing':
@@ -533,6 +646,10 @@ async def handle_chat_and_media(message: Message):
             [
                 InlineKeyboardButton(text="🐱 Да, это кот!", callback_data=f"check_cat:yes:{user_id}:{file_unique_id}"),
                 InlineKeyboardButton(text="📸 Просто фото", callback_data=f"check_cat:no:{user_id}:{file_unique_id}")
+            ],
+            [
+                # Новая кнопка ЖАЛОБЫ
+                InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}")
             ]
         ])
 
