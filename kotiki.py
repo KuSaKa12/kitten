@@ -176,6 +176,11 @@ async def cmd_ban(message: Message, command: CommandObject):
     await perform_ban(target_id)
     await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
 
+@router.message(Command("my_chat_id"))
+async def get_id(message: Message):
+    await message.answer(f"ID этого чата: {message.chat.id}")
+
+
 async def perform_ban(target_id: int):
     # Проверяем, находится ли нарушитель сейчас в игре
     cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,))
