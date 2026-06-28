@@ -19,19 +19,20 @@ class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user_id = event.from_user.id
         
-        # Проверяем базу данных
+        # БЕЛЫЙ СПИСОК: админ всегда проходит
+        if str(user_id) == str(ADMIN_ID):
+            return await handler(event, data)
+        
+        # Проверка базы для остальных
         async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
             if await cursor.fetchone():
-                # Если пользователь в бане — просто блокируем событие
                 if isinstance(event, Message):
                     await event.answer("🚫 Вы заблокированы.")
                 elif isinstance(event, CallbackQuery):
                     await event.answer("🚫 Вы заблокированы.", show_alert=True)
-                return # Прерываем цепочку, событие не дойдет до хендлеров
-
-        # Если не в бане — продолжаем выполнение
+                return # Стоп-сигнал, дальше не идем
+        
         return await handler(event, data)
-
 
 
 
@@ -351,8 +352,28 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
     )
     await state.set_state(Registration.waiting_for_age)
 
+# --- ФУНКЦИЯ РАЗБАНА ---
+@router.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject):
+    # Проверка, что пишет именно админ (сравнение типов)
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
 
-
+    if not command.args:
+        await message.answer("⚠️ Использование: /unban <ID>")
+        return
+        
+    try:
+        target_id = int(command.args)
+        # Удаляем из таблицы банов
+        await db_conn.execute("DELETE FROM banned_users WHERE user_id = ?", (target_id,))
+        # Возвращаем статус 'idle', если он был 'banned'
+        await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ? AND status = 'banned'", (target_id,))
+        await db_conn.commit()
+        
+        await message.answer(f"✅ Пользователь {target_id} успешно разбанен!")
+    except ValueError:
+        await message.answer("❌ ID должен быть числом.")
 
 # --- СИСТЕМА ОБЫЧНЫХ РЕПОРТОВ (БАГИ, ПРЕДЛОЖЕНИЯ РАЗРАБУ) ---
 @router.message(Command("report"))
@@ -961,14 +982,12 @@ async def handle_chat_and_media(message: Message):
 
 
 async def main():
-    await init_db()  # Сначала создаем базу
+    await init_db()
     
-    # Регистрация Middleware в диспетчере
-    # Это перехватывает все обновления (сообщения, нажатия кнопок) до их обработки
+    # 1. Сначала добавляем все роутеры
+    dp.include_router(router)
+    
+    # 2. Только потом вешаем Middleware
     dp.update.middleware(BanCheckMiddleware())
     
-    dp.include_router(router)
-    await dp.start_polling(bot) # Только потом начинаем работу
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await dp.start_polling(bot)
