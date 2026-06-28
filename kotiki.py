@@ -17,23 +17,25 @@ from aiogram import BaseMiddleware
 
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        user_id = event.from_user.id
+        # Проверяем, есть ли у события атрибут from_user
+        user = event.from_user if hasattr(event, "from_user") else None
         
-        # БЕЛЫЙ СПИСОК: админ всегда проходит
-        if str(user_id) == str(ADMIN_ID):
+        # Если пользователя нет (техническое обновление), просто пропускаем его дальше
+        if user is None:
             return await handler(event, data)
         
-        # Проверка базы для остальных
+        user_id = user.id
+        
+        # Проверяем базу данных
         async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
             if await cursor.fetchone():
                 if isinstance(event, Message):
                     await event.answer("🚫 Вы заблокированы.")
                 elif isinstance(event, CallbackQuery):
                     await event.answer("🚫 Вы заблокированы.", show_alert=True)
-                return # Стоп-сигнал, дальше не идем
-        
-        return await handler(event, data)
+                return # Прерываем цепочку
 
+        return await handler(event, data)
 
 
 CHANNEL_ID = "@ITkaktusik"
