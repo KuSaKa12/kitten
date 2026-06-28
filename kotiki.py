@@ -582,6 +582,7 @@ async def process_target_gender(message: Message, state: FSMContext):
     )
 
 
+# --- ПОИСК ИГРОКА ---
 @router.message(F.text == "🔍 Найти игрока")
 async def find_player(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -596,55 +597,59 @@ async def find_player(message: Message, state: FSMContext):
         )
         return
 
-    # 1. Получаем данные текущего пользователя
-    async with db_conn.execute("SELECT status, gender, target_gender FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    # Читаем возраст (age_category) из БД вместе с остальными данными
+    async with db_conn.execute("SELECT status, gender, target_gender, age_category FROM users WHERE user_id = ?", (user_id,)) as cursor:
         u_data = await cursor.fetchone()
     
     if not u_data:
         await cmd_start(message, state)
         return
 
-    current_status, u_gender, u_target = u_data
+    current_status, u_gender, u_target, u_age = u_data
 
     if current_status == 'banned':
-        await message.answer("❌ Вы навсегда заблокированы.")
+        await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
         return
 
     if current_status == 'playing':
         await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
         return
 
-    # 2. Пытаемся найти подходящего собеседника
-    # Логика: ищем кого-то в поиске, кто подходит нам, и кому подходим мы
-    async with db_conn.execute("""
-        SELECT user_id FROM users 
-        WHERE status = 'searching' 
-        AND user_id != ? 
-        AND (target_gender = 'any' OR target_gender = ?)
-        AND (gender = ? OR ? = 'any')
-        LIMIT 1
-    """, (user_id, u_gender, u_target, u_gender)) as cursor:
+    # Теперь в запросе есть строгое условие: AND age_category = ?
+    query = """
+        UPDATE users 
+        SET status = 'playing', current_opponent = ?, current_match_cats = 0
+        WHERE user_id = (
+            SELECT user_id FROM users 
+            WHERE status = 'searching' 
+              AND user_id != ? 
+              AND (target_gender = 'any' OR target_gender = ?)
+              AND (? = 'any' OR gender = ?)
+              AND age_category = ? 
+            LIMIT 1
+        )
+        RETURNING user_id
+    """
+    
+    # Передаем u_age последним аргументом
+    async with db_conn.execute(query, (user_id, user_id, u_gender, u_target, u_target, u_age)) as cursor:
         opponent = await cursor.fetchone()
 
     if opponent:
         opponent_id = opponent[0]
         
-        # 3. Соединяем обоих (обновляем обоих в одной транзакции)
-        await db_conn.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (opponent_id, user_id))
-        await db_conn.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (user_id, opponent_id))
+        await db_conn.execute(
+            "UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", 
+            (opponent_id, user_id)
+        )
         await db_conn.commit()
 
         await message.answer("🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
-        try:
-            await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
-        except Exception:
-            pass # Если бот не может написать оппоненту
+        await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
     else:
-        # 4. Если никого нет, встаем в очередь
         await db_conn.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
         await db_conn.commit()
         await message.answer("🔍 Ищем собеседника... Пожалуйста, подожди.", reply_markup=get_search_menu())
-
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ ---
 @router.message(F.text == "🏁 Завершить игру")
 async def ask_end_game(message: Message):
@@ -745,12 +750,14 @@ async def process_confirm_exit(callback: CallbackQuery):
     if action == "yes":
         opponent_id = res[1]
         
+        # БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ СЧЕТА (исправлен краш)
         async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            my_score = await cursor.fetchone()[0]
+            row = await cursor.fetchone()
+            my_score = row[0] if row else 0
 
         async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,)) as cursor:
             opp_score_data = await cursor.fetchone()
-        opp_score = opp_score_data[0] if opp_score_data else 0
+            opp_score = opp_score_data[0] if opp_score_data else 0
 
         await db_conn.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
@@ -763,7 +770,6 @@ async def process_confirm_exit(callback: CallbackQuery):
 
         await bot.send_message(user_id, text_for_me + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
         await bot.send_message(opponent_id, text_for_opp + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
-
 
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
