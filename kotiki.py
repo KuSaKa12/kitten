@@ -1,4 +1,4 @@
-
+import aiosqlite
 import socket
 import sys
 import asyncio
@@ -15,6 +15,55 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 CHANNEL_ID = "@ITkaktusik"
+db_path = "/app/data/cat_game.db"
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+# Глобальная переменная для базы
+# Подключение к БД
+db_path = "/app/data/cat_game.db"
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+# Глобальная переменная для базы
+db_conn = None
+
+async def init_db():
+    global db_conn
+    # Открываем базу асинхронно
+    db_conn = await aiosqlite.connect(db_path)
+    await db_conn.execute('''
+    CREATE TABLE IF NOT EXISTS banned_users (
+        user_id INTEGER PRIMARY KEY
+    )''')
+    # Создаем таблицы (все сразу здесь)
+    await db_conn.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        age_category TEXT,
+        gender TEXT,
+        target_gender TEXT,
+        status TEXT DEFAULT 'idle', 
+        current_match_cats INTEGER DEFAULT 0, 
+        total_cats INTEGER DEFAULT 0,         
+        current_opponent INTEGER DEFAULT NULL
+    )''')
+    
+    await db_conn.execute('''
+    CREATE TABLE IF NOT EXISTS cat_photos (
+        file_unique_id TEXT PRIMARY KEY,
+        user_id INTEGER
+    )''')
+    
+    await db_conn.execute('''
+    CREATE TABLE IF NOT EXISTS chat_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER,
+        receiver_id INTEGER,
+        text TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    await db_conn.commit()
 
 # Настройки для Windows
 if sys.platform == 'win32':
@@ -39,44 +88,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Подключение к БД
-db_path = "/app/data/cat_game.db"
-os.makedirs(os.path.dirname(db_path), exist_ok=True)
-conn = sqlite3.connect(db_path, check_same_thread=False)
-cursor = conn.cursor()
-
-# Таблица пользователей
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    age_category TEXT,
-    gender TEXT,
-    target_gender TEXT,
-    status TEXT DEFAULT 'idle', 
-    current_match_cats INTEGER DEFAULT 0, 
-    total_cats INTEGER DEFAULT 0,         
-    current_opponent INTEGER DEFAULT NULL
-)''')
-
-# Таблица фото
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS cat_photos (
-    file_unique_id TEXT PRIMARY KEY,
-    user_id INTEGER
-)''')
-
-# Таблица логов чата для модерации (последние сообщения)
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS chat_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sender_id INTEGER,
-    receiver_id INTEGER,
-    text TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)''')
-
-conn.commit()
 
 
 class Registration(StatesGroup):
@@ -186,14 +197,15 @@ async def cmd_ban(message: Message, command: CommandObject):
     await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
 
 async def perform_ban(target_id: int):
-    # Проверяем, находится ли нарушитель сейчас в игре
-    cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,))
-    res = cursor.fetchone()
+    # 1. Сначала узнаем ID оппонента
+    async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,)) as cursor:
+        res = await cursor.fetchone()
     
-    # Если он в игре, завершаем игру для собеседника
     if res and res[0]:
         opp_id = res[0]
-        cursor.execute("UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?", (opp_id,))
+        # Используем await db_conn.execute для изменения данных
+        await db_conn.execute("UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?", (opp_id,))
+        # ... (код отправки сообщения оппоненту)
         try:
             await bot.send_message(
                 opp_id, 
@@ -204,8 +216,8 @@ async def perform_ban(target_id: int):
             pass
 
     # Выдаем бан
-    cursor.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
-    conn.commit()
+    await db_conn.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
+    await db_conn.commit() # Обязательно await!
 
     # Уведомляем самого нарушителя
     try:
@@ -242,75 +254,50 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    if action == "yes":
-        # 1. Получаем ID оппонента ДО начала удаления
-        cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
-        res = cursor.fetchone()
-        opp_id = res[0] if res and res[0] else None
+    # 1. Получаем ID оппонента ДО удаления
+    async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
+    opp_id = res[0] if res else None
 
-        # 2. Безопасная транзакция в БД
-        try:
-            # Начинаем транзакцию (в sqlite3 python она часто стартует автоматически при DML, 
-            # но мы задаем жесткие рамки)
-            conn.execute("BEGIN TRANSACTION")
-
-            # Если пользователь в игре, освобождаем оппонента
-            if opp_id:
-                cursor.execute(
-                    "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?", 
-                    (opp_id,)
-                )
-
-            # Удаляем данные пользователя
-            cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
-            
-            # Удаляем ТОЛЬКО сообщения, отправленные самим пользователем
-            # (Чужие сообщения, где он был получателем, остаются)
-            cursor.execute("DELETE FROM chat_history WHERE sender_id = ?", (user_id,))
-
-            # Фиксируем изменения
-            conn.commit()
-            logging.info(f"[DELETE] Данные пользователя {user_id} успешно удалены.")
-
-        except sqlite3.Error as db_err:
-            # Если что-то пошло не так (например, lock базы или ошибка ключей) — откатываем ВСЁ
-            conn.rollback()
-            logging.error(f"[DELETE ERROR] Ошибка БД при удалении пользователя {user_id}: {db_err}")
-            await callback.message.edit_text("❌ Произошла ошибка базы данных. Попробуй позже или обратись в поддержку.")
-            await callback.answer()
-            return
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"[DELETE ERROR] Непредвиденная ошибка при удалении {user_id}: {e}")
-            await callback.message.edit_text("❌ Произошла непредвиденная ошибка сервера.")
-            await callback.answer()
-            return
-
-        # 3. Очищаем машину состояний (выполняется только если БД отработала успешно)
-        await state.clear()
-
-        # 4. Взаимодействие с Telegram API (вынесено отдельно, чтобы ошибки сети не ломали БД)
-        
-        # Уведомляем оппонента
+    # 2. Выполняем очистку базы
+    try:
+        # Сначала сбрасываем состояние оппонента, если он есть
         if opp_id:
-            try:
-                await callback.bot.send_message(
-                    opp_id, 
-                    "⚠️ Твой собеседник удалил свой профиль. Игра завершена.", 
-                    reply_markup=get_main_menu()
-                )
-            except Exception as e:
-                # Если оппонент заблокировал бота, просто логируем и идем дальше
-                logging.info(f"Не удалось отправить уведомление оппоненту {opp_id} (вероятно, бот заблокирован): {e}")
+            await db_conn.execute(
+                "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?", 
+                (opp_id,)
+            )
 
-        # Уведомляем самого пользователя
+        # Удаляем пользователя и его данные
+        await db_conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        await db_conn.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
+        await db_conn.execute("DELETE FROM chat_history WHERE sender_id = ? OR receiver_id = ?", (user_id, user_id))
+        
+        await db_conn.commit()
+
+    except Exception as e:
+        await db_conn.rollback()
+        logging.error(f"[DELETE ERROR] Ошибка при удалении пользователя {user_id}: {e}")
+        await callback.message.edit_text("❌ Произошла ошибка базы данных. Попробуй позже.")
+        await callback.answer()
+        return
+
+    # 3. Уведомляем оппонента (внешнее взаимодействие)
+    if opp_id:
         try:
-            await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы. Надеемся еще увидеть тебя!")
-        except Exception:
-            pass  # Если сообщение уже устарело, игнорируем
-            
-        await callback.answer("Данные удалены.")
+            await callback.bot.send_message(
+                opp_id, 
+                "⚠️ Твой собеседник удалил свой профиль. Игра завершена.", 
+                reply_markup=get_main_menu()
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить оппонента {opp_id} об удалении: {e}")
+
+    # 4. Завершаем работу
+    await state.clear()
+    await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы. Надеемся еще увидеть тебя!")
+    await callback.answer("Данные удалены.")
+
 # --- ОБРАБОТЧИКИ КНОПОК МОДЕРАЦИИ (INLINE) ---
 @router.callback_query(F.data.startswith("mod_ban:"))
 async def mod_ban_handler(callback: CallbackQuery):
@@ -349,8 +336,8 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
 # --- СИСТЕМА ОБЫЧНЫХ РЕПОРТОВ (БАГИ, ПРЕДЛОЖЕНИЯ РАЗРАБУ) ---
 @router.message(Command("report"))
 async def cmd_report(message: Message, state: FSMContext):
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,))
-    res = cursor.fetchone()
+    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
+        res = cursor.fetchone()
     if res and res[0] == 'banned':
         return
 
@@ -361,8 +348,8 @@ async def cmd_report(message: Message, state: FSMContext):
 async def process_report(message: Message, state: FSMContext):
     user_id = message.from_user.id
     
-    cursor.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
+    async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
     opp_id_text = f"Последний собеседник ID: <code>{res[0]}</code>" if res and res[0] else "Собеседника нет"
 
     user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{user_id}</code>)\n{opp_id_text}"
@@ -398,20 +385,28 @@ async def process_report(message: Message, state: FSMContext):
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    cursor.execute("SELECT age_category, status FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
+    # 1. ПРОВЕРКА НА БАН (по новой таблице)
+    async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
+        if await cursor.fetchone():
+            await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
+            return
 
+    # 2. Обычная проверка статуса
+    async with db_conn.execute("SELECT age_category, status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
+
+    # (Опционально: можно оставить проверку статуса, если бан еще есть в таблице users)
     if res and res[1] == 'banned':
         await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
         return
 
+    # 3. Сброс игры, если пользователь уже зарегистрирован
     if res and res[0] is not None:
-        cursor.execute(
+        await db_conn.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?",
-            (user_id,))
-        conn.commit()
-        await message.answer("Привет снова! Готов к поиску?", reply_markup=get_main_menu())
-        return
+            (user_id,)
+        )
+        await db_conn.commit()
 
     rules_text = (
         "🐾 <b>Добро пожаловать в «котоLOVе»!</b>\n"
@@ -441,8 +436,10 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(F.text == "⚙️ Изменить профиль")
 async def change_profile(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
+    
+    # Теперь правильно: res находится ВНУТРИ блока
+    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
 
     if not res:
         await cmd_start(message, state)
@@ -457,9 +454,9 @@ async def change_profile(message: Message, state: FSMContext):
         return
 
     if res[0] == 'searching':
-        cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
-        conn.commit()
-
+        # ИСПРАВЛЕНИЕ: используем асинхронный вызов и await
+        await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
+        await db_conn.commit() # Обязательно с await!
     await start_registration_flow(message, state, "🔄 Сброс настроек анкеты.\n")
 
 
@@ -517,15 +514,15 @@ async def process_target_gender(message: Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username or f"User_{user_id}"
 
-    cursor.execute("SELECT total_cats FROM users WHERE user_id = ?", (user_id,))
-    old_total = cursor.fetchone()
+    async with db_conn.execute("SELECT total_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        old_total = await cursor.fetchone()
     total_cats_to_save = old_total[0] if old_total else 0
 
-    cursor.execute('''
+    await db_conn.execute('''
         INSERT OR REPLACE INTO users (user_id, username, age_category, gender, target_gender, status, current_match_cats, total_cats)
         VALUES (?, ?, ?, ?, ?, 'idle', 0, ?)
     ''', (user_id, username, user_data['age_category'], user_data['gender'], target_val, total_cats_to_save))
-    conn.commit()
+    await db_conn.commit()
 
     await state.clear()
     await message.answer(
@@ -535,6 +532,7 @@ async def process_target_gender(message: Message, state: FSMContext):
     )
 
 
+# --- ПОИСК ИГРОКА ---
 # --- ПОИСК ИГРОКА ---
 @router.message(F.text == "🔍 Найти игрока")
 async def find_player(message: Message, state: FSMContext):
@@ -550,8 +548,9 @@ async def find_player(message: Message, state: FSMContext):
         )
         return
 
-    cursor.execute("SELECT status, gender, target_gender FROM users WHERE user_id = ?", (user_id,))
-    u_data = cursor.fetchone()
+    # ЧТЕНИЕ (SELECT) - используем async with
+    async with db_conn.execute("SELECT status, gender, target_gender FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        u_data = await cursor.fetchone()
     
     if not u_data:
         await cmd_start(message, state)
@@ -580,49 +579,36 @@ async def find_player(message: Message, state: FSMContext):
         )
         RETURNING user_id
     """
-    cursor.execute(query, (user_id, user_id, u_gender, u_target, u_target))
-    opponent = cursor.fetchone()
+    
+    # ЧТЕНИЕ (UPDATE ... RETURNING работает как SELECT, он возвращает данные)
+    async with db_conn.execute(query, (user_id, user_id, u_gender, u_target, u_target)) as cursor:
+        opponent = await cursor.fetchone()
 
     if opponent:
         opponent_id = opponent[0]
         
-        # Теперь обновляем статус самого искателя
-        cursor.execute(
+        # ЗАПИСЬ (UPDATE) - просто выполняем запрос и делаем commit
+        await db_conn.execute(
             "UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", 
             (opponent_id, user_id)
         )
-        conn.commit()
+        await db_conn.commit()
 
         await message.answer("🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
         await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
     else:
-        # Если никого нет, встаем в поиск
-        cursor.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
-        conn.commit()
+        # ЗАПИСЬ (UPDATE) - встаем в поиск
+        await db_conn.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
+        await db_conn.commit()
         await message.answer("🔍 Ищем собеседника... Пожалуйста, подожди.", reply_markup=get_search_menu())
-
-
-# --- ОСТАНОВКА ПОИСКА ---
-@router.message(F.text == "🛑 Остановить поиск")
-async def stop_search(message: Message):
-    user_id = message.from_user.id
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-
-    if res and res[0] == 'searching':
-        cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
-        conn.commit()
-        await message.answer("🛑 Поиск отменен.", reply_markup=get_main_menu())
-    else:
-        await message.answer("Вы сейчас не в поиске.", reply_markup=get_main_menu())
 
 
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ ---
 @router.message(F.text == "🏁 Завершить игру")
 async def ask_end_game(message: Message):
     user_id = message.from_user.id
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
+    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
 
     if res and res[0] == 'playing':
         await message.answer(
@@ -640,28 +626,23 @@ async def ask_end_game(message: Message):
 @router.message(F.text == "🚨 Пожаловаться на собеседника")
 async def report_player_chat(message: Message):
     user_id = message.from_user.id
-    cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
+    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
 
     if not res or res[0] != 'playing':
         return await message.answer("Эта функция доступна только во время игры.")
 
     opponent_id = res[1]
-    
-    if not MODERATION_CHAT_ID:
-        return await message.answer("❌ Сервер модерации временно недоступен.")
-
-    # Получаем историю сообщений за последние 20 минут между этими двумя игроками
     time_limit = (datetime.now() - timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
     
-    cursor.execute("""
+    # ИСПОЛЬЗУЕМ async with cursor КАК В ДРУГИХ МЕСТАХ
+    async with db_conn.execute("""
         SELECT sender_id, text, timestamp FROM chat_history
         WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
           AND timestamp >= ?
         ORDER BY timestamp ASC
-    """, (user_id, opponent_id, opponent_id, user_id, time_limit))
-    
-    history = cursor.fetchall()
+    """, (user_id, opponent_id, opponent_id, user_id, time_limit)) as cursor:
+        history = await cursor.fetchall()
     
     history_text = ""
     for sender, txt, ts in history:
@@ -708,8 +689,8 @@ async def process_confirm_exit(callback: CallbackQuery):
     except Exception:
         pass
 
-    cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
+    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
 
     if not res or res[0] != 'playing':
         await bot.send_message(user_id, "Вы уже не находитесь в игре.", reply_markup=get_main_menu())
@@ -722,17 +703,18 @@ async def process_confirm_exit(callback: CallbackQuery):
     if action == "yes":
         opponent_id = res[1]
         
-        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,))
-        my_score = cursor.fetchone()[0]
+       async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            my_score = await cursor.fetchone()[0]
 
-        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,))
-        opp_score_data = cursor.fetchone()
+        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,)) as cursor:
+            opp_score_data = await cursor.fetchone()
         opp_score = opp_score_data[0] if opp_score_data else 0
 
-        cursor.execute(
+        await db_conn.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
-            (user_id, opponent_id))
-        conn.commit()
+            (user_id, opponent_id)
+        )
+        await db_conn.commit()
 
         text_for_me = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет собеседника: 🐈 {opp_score}"
         text_for_opp = f"⚠️ Собеседник завершил игру.\n\nИгра завершена!\n📊 Твой счет в этом раунде: 🐈 {opp_score}\n📊 Счет собеседника: 🐈 {my_score}"
@@ -744,13 +726,13 @@ async def process_confirm_exit(callback: CallbackQuery):
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
-    cursor.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,))
-    res = cursor.fetchone()
+    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
+        res = await cursor.fetchone()
     if res and res[0] == 'banned':
         return
 
-    cursor.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10")
-    leaders = cursor.fetchall()
+    async with db_conn.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10") as cursor:
+        leaders = await cursor.fetchall()
     
     if not leaders:
         await message.answer("🏆 Пока в таблице лидеров пусто.")
@@ -777,6 +759,22 @@ async def verify_cat_photo(callback: CallbackQuery):
     action = data_parts[1]
     sender_id = int(data_parts[2])
     file_unique_id = data_parts[3]
+    
+    # Добавляем получение file_id, если он есть в данных
+    file_id = data_parts[4] if len(data_parts) > 4 else None
+    
+    # ... (дальше идет твой код) ...
+
+    elif action == "report":
+        # ...
+        if MODERATION_CHAT_ID and file_id: # Используем наш новый file_id
+            try:
+                await bot.send_photo(
+                    MODERATION_CHAT_ID,
+                    file_id, # ВОТ СЮДА ВСТАВЛЯЕМ ЕГО
+                    caption=f"🚨 <b>ЖАЛОБА НА ФОТО...</b>",
+                    # ...
+                )
 
     await callback.answer()
     
@@ -785,48 +783,56 @@ async def verify_cat_photo(callback: CallbackQuery):
     except:
         pass
 
-    cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (sender_id,))
-    sender_data = cursor.fetchone()
+    # Используем асинхронный контекстный менеджер для всех операций
+    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (sender_id,)) as cursor:
+        sender_data = await cursor.fetchone()
+    
     if not sender_data or sender_data[0] != 'playing':
         if action != "report":
             await callback.message.answer("⚠️ Эта игра уже завершена.")
             return
 
     if action == "yes":
-        cursor.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,))
-        if cursor.fetchone():
-            await bot.send_message(sender_id, "❌ Это фото кота уже использовалось в игре! Балл не засчитан.")
-            await callback.message.answer("Это фото уже было засчитано ранее в базе данных.")
-            return
+        # Проверка на повторное использование
+        async with db_conn.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,)) as cursor:
+            if await cursor.fetchone():
+                await bot.send_message(sender_id, "❌ Это фото кота уже использовалось в игре! Балл не засчитан.")
+                await callback.message.answer("Это фото уже было засчитано ранее.")
+                return
 
-        cursor.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, sender_id))
-        cursor.execute(
+        # Запись фото и начисление баллов (в одной транзакции)
+        await db_conn.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, sender_id))
+        await db_conn.execute(
             "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
-            (sender_id,))
-        conn.commit()
+            (sender_id,)
+        )
+        await db_conn.commit()
 
-        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,))
-        sender_score = cursor.fetchone()[0]
+        # Получение обновленных баллов
+        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,)) as cursor:
+            s_score = await cursor.fetchone()
+            sender_score = s_score[0] if s_score else 0
 
-        cursor.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (callback.from_user.id,))
-        my_score = cursor.fetchone()[0]
+        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (callback.from_user.id,)) as cursor:
+            m_score = await cursor.fetchone()
+            my_score = m_score[0] if m_score else 0
 
-        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил твоего котика! Твой счет в этой игре: {sender_score}")
+        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил твоего котика! Твой счет: {sender_score}")
         await callback.message.answer(f"✅ Засчитано! У собеседника теперь {sender_score} 🐈\nТвой счет: {my_score}")
 
     elif action == "no":
-        await bot.send_message(sender_id, "📸 Собеседник отметил твое фото как обычный снимок. Балл за котика не начислен.")
-        await callback.message.answer("Принято! Фото сохранено в истории чата, балл не начислялся.")
+        await bot.send_message(sender_id, "📸 Собеседник отметил твое фото как обычный снимок.")
+        await callback.message.answer("Принято!")
 
     elif action == "report":
         await bot.send_message(sender_id, "⚠️ На ваше фото поступила жалоба. Ожидайте решения модератора.")
         await callback.message.answer("🚨 Жалоба успешно отправлена администратору. Спасибо за бдительность!")
 
-        if MODERATION_CHAT_ID:
+        if MODERATION_CHAT_ID and file_id: # Проверяем, что ID есть
             try:
                 await bot.send_photo(
                     MODERATION_CHAT_ID,
-                    callback.message.photo[-1].file_id,
+                    file_id,  # <--- ИСПОЛЬЗУЕМ ПЕРЕДАННЫЙ ID
                     caption=(
                         f"🚨 <b>ЖАЛОБА НА ФОТО (НСФВ/Спам)</b>\n"
                         f"Нарушитель ID: <code>{sender_id}</code>\n"
@@ -843,36 +849,37 @@ async def verify_cat_photo(callback: CallbackQuery):
 @router.message()
 async def handle_chat_and_media(message: Message):
     user_id = message.from_user.id
-    cursor.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
+    
+    # Получаем данные пользователя
+    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
 
-    if not res:
+    if not res or res[0] == 'banned':
         return
 
-    if res[0] == 'banned':
-        return
-
+    # Логика для тех, кто не в игре
     if res[0] != 'playing':
         if message.photo:
-            await message.answer(
-                "❌ Ты не можешь отправлять котиков просто так! Сначала нажми «🔍 Найти игрока» и найди собеседника.")
-        else:
-            if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль"]:
-                return
+            await message.answer("❌ Ты не можешь отправлять котиков просто так! Сначала нажми «🔍 Найти игрока».")
+        elif message.text not in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль"]:
             await message.answer("Воспользуйся кнопками меню!", reply_markup=get_main_menu())
         return
 
     opponent_id = res[1]
     
+    # Если оппонент потерян
     if not opponent_id:
-        cursor.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
-        conn.commit()
+        await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
+        await db_conn.commit()
         await message.answer("⚠️ Ошибка: собеседник потерян. Пожалуйста, начни поиск заново.", reply_markup=get_main_menu())
         return
 
+    # Обработка фото
     if message.photo:
         photo = message.photo[-1]
         file_unique_id = photo.file_unique_id
+
+        file_id = photo.file_id 
 
         verify_kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -880,7 +887,8 @@ async def handle_chat_and_media(message: Message):
                 InlineKeyboardButton(text="📸 Просто фото", callback_data=f"check_cat:no:{user_id}:{file_unique_id}")
             ],
             [
-                InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}")
+                # Сюда добавляем :file_id в конец строки
+                InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}:{file_id}")
             ]
         ])
 
@@ -895,12 +903,15 @@ async def handle_chat_and_media(message: Message):
         )
         return
 
-    if message.text:
+   if message.text:
+        # Игнорируем кнопки, если они случайно проскочили
         if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль", "🏁 Завершить игру", "🚨 Пожаловаться на собеседника"]:
             return
         
-        cursor.execute("INSERT INTO chat_history (sender_id, receiver_id, text) VALUES (?, ?, ?)", (user_id, opponent_id, message.text))
-        conn.commit()
+        # АСИНХРОННАЯ ЗАПИСЬ
+        await db_conn.execute("INSERT INTO chat_history (sender_id, receiver_id, text) VALUES (?, ?, ?)", 
+                             (user_id, opponent_id, message.text))
+        await db_conn.commit()
 
         try:
             await bot.send_message(opponent_id, message.text)
@@ -909,9 +920,9 @@ async def handle_chat_and_media(message: Message):
 
 
 async def main():
+    await init_db()  # <--- Бот сначала создаст базу
     dp.include_router(router)
-    await dp.start_polling(bot)
-
+    await dp.start_polling(bot) # <--- Потом начнет работать
 
 if __name__ == "__main__":
     asyncio.run(main())
