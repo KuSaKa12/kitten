@@ -759,25 +759,45 @@ async def verify_cat_photo(callback: CallbackQuery):
     action = data_parts[1]
     sender_id = int(data_parts[2])
     file_unique_id = data_parts[3]
-    
-    # Добавляем получение file_id, если он есть в данных
     file_id = data_parts[4] if len(data_parts) > 4 else None
     
-    # ... (дальше идет твой код) ...
+    if action == "yes":
+        # Используем асинхронный контекстный менеджер
+        async with db_conn.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,)) as cursor:
+            if await cursor.fetchone():
+                await bot.send_message(sender_id, "❌ Это фото кота уже использовалось в игре!")
+                await callback.message.answer("Это фото уже было засчитано ранее.")
+                return
+
+        # Асинхронные вставки и обновления
+        await db_conn.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, sender_id))
+        await db_conn.execute(
+            "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
+            (sender_id,)
+        )
+        await db_conn.commit()
+
+        # Асинхронное получение данных
+        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,)) as cursor:
+            row = await cursor.fetchone()
+            sender_score = row[0] if row else 0
+
+        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (callback.from_user.id,)) as cursor:
+            row = await cursor.fetchone()
+            my_score = row[0] if row else 0
+
+        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил котика! Твой счет: {sender_score}")
+        await callback.message.answer(f"✅ Засчитано! Счет собеседника: {sender_score} 🐈\nТвой счет: {my_score}")
+
+    elif action == "no":
+        await bot.send_message(sender_id, "📸 Собеседник отметил твое фото как обычный снимок.")
+        await callback.message.answer("Принято!")
 
     elif action == "report":
-        # ...
-        if MODERATION_CHAT_ID and file_id: # Используем наш новый file_id
-            try:
-                await bot.send_photo(
-                    MODERATION_CHAT_ID,
-                    file_id, # ВОТ СЮДА ВСТАВЛЯЕМ ЕГО
-                    caption=f"🚨 <b>ЖАЛОБА НА ФОТО...</b>",
-                    # ...
-                )
+        # ... ваша логика репорта ...
+        pass
 
     await callback.answer()
-    
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except:
