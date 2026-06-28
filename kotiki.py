@@ -17,29 +17,30 @@ from aiogram import BaseMiddleware
 
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        # 1. Безопасно получаем пользователя
         user = event.from_user if hasattr(event, "from_user") else None
         
-        # 2. Проверяем, является ли это командой /delete_data
-        # Если это сообщение и текст "/delete_data" — разрешаем проход дальше
-        if isinstance(event, Message) and event.text == "/delete_data":
-            return await handler(event, data)
-
-        # 3. Если пользователя нет — пропускаем
         if user is None:
             return await handler(event, data)
         
-        user_id = user.id
-        
-        # 4. Проверяем бан
-        async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
-            if await cursor.fetchone():
-                # Если в бане — блокируем все, кроме /delete_data (которая уже прошла проверку выше)
-                if isinstance(event, Message):
-                    await event.answer("🚫 Вы заблокированы. Вы можете использовать только команду /delete_data, чтобы удалить свой профиль.")
-                elif isinstance(event, CallbackQuery):
-                    await event.answer("🚫 Вы заблокированы.", show_alert=True)
-                return 
+        # Проверяем наличие пользователя в таблице банов
+        async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user.id,)) as cursor:
+            is_banned = await cursor.fetchone()
+
+        if is_banned:
+            # Разрешаем команду /delete_data
+            if isinstance(event, Message) and event.text == "/delete_data":
+                return await handler(event, data)
+            
+            # Разрешаем нажатие на кнопки "Да/Нет" при удалении данных
+            if isinstance(event, CallbackQuery) and event.data.startswith("delete_confirm_"):
+                return await handler(event, data)
+
+            # Блокируем ВСЁ остальное
+            if isinstance(event, Message):
+                await event.answer("🚫 Вы заблокированы. Вы можете использовать только команду /delete_data, чтобы удалить свои данные.")
+            elif isinstance(event, CallbackQuery):
+                await event.answer("🚫 Вы заблокированы.", show_alert=True)
+            return # Прерываем выполнение
 
         return await handler(event, data)
 
@@ -233,9 +234,7 @@ async def perform_ban(target_id: int):
     
     if res and res[0]:
         opp_id = res[0]
-        # Используем await db_conn.execute для изменения данных
         await db_conn.execute("UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?", (opp_id,))
-        # ... (код отправки сообщения оппоненту)
         try:
             await bot.send_message(
                 opp_id, 
@@ -245,9 +244,12 @@ async def perform_ban(target_id: int):
         except:
             pass
 
-    # Выдаем бан
+    # === ГЛАВНЫЙ ФИКС ===
+    # 1. Заносим в таблицу вечных банов
+    await db_conn.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (target_id,))
+    # 2. Меняем статус в обычной таблице
     await db_conn.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
-    await db_conn.commit() # Обязательно await!
+    await db_conn.commit() 
 
     # Уведомляем самого нарушителя
     try:
@@ -258,7 +260,6 @@ async def perform_ban(target_id: int):
         )
     except Exception as e:
         logging.warning(f"Не удалось отправить сообщение о бане пользователю {target_id}: {e}")
-
 
 
 # Команда для удаления данных
@@ -363,7 +364,6 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
 # --- ФУНКЦИЯ РАЗБАНА ---
 @router.message(Command("unban"))
 async def cmd_unban(message: Message, command: CommandObject):
-    # Проверка, что пишет именно админ (сравнение типов)
     if str(message.from_user.id) != str(ADMIN_ID):
         return
 
@@ -373,16 +373,16 @@ async def cmd_unban(message: Message, command: CommandObject):
         
     try:
         target_id = int(command.args)
-        # Удаляем из таблицы банов
+        # Удаляем из вечного бана
         await db_conn.execute("DELETE FROM banned_users WHERE user_id = ?", (target_id,))
-        # Возвращаем статус 'idle', если он был 'banned'
+        # Обновляем статус в таблице юзеров (если он не удалил аккаунт)
         await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ? AND status = 'banned'", (target_id,))
         await db_conn.commit()
         
-        await message.answer(f"✅ Пользователь {target_id} успешно разбанен!")
+        await message.answer(f"✅ Пользователь <code>{target_id}</code> успешно разбанен!", parse_mode="HTML")
     except ValueError:
         await message.answer("❌ ID должен быть числом.")
-
+        
 # --- СИСТЕМА ОБЫЧНЫХ РЕПОРТОВ (БАГИ, ПРЕДЛОЖЕНИЯ РАЗРАБУ) ---
 @router.message(Command("report"))
 async def cmd_report(message: Message, state: FSMContext):
