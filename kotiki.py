@@ -582,8 +582,6 @@ async def process_target_gender(message: Message, state: FSMContext):
     )
 
 
-# --- ПОИСК ИГРОКА ---
-# --- ПОИСК ИГРОКА ---
 @router.message(F.text == "🔍 Найти игрока")
 async def find_player(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -598,7 +596,7 @@ async def find_player(message: Message, state: FSMContext):
         )
         return
 
-    # ЧТЕНИЕ (SELECT) - используем async with
+    # 1. Получаем данные текущего пользователя
     async with db_conn.execute("SELECT status, gender, target_gender FROM users WHERE user_id = ?", (user_id,)) as cursor:
         u_data = await cursor.fetchone()
     
@@ -609,49 +607,43 @@ async def find_player(message: Message, state: FSMContext):
     current_status, u_gender, u_target = u_data
 
     if current_status == 'banned':
-        await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
+        await message.answer("❌ Вы навсегда заблокированы.")
         return
 
     if current_status == 'playing':
         await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
         return
 
-    query = """
-        UPDATE users 
-        SET status = 'playing', current_opponent = ?, current_match_cats = 0
-        WHERE user_id = (
-            SELECT user_id FROM users 
-            WHERE status = 'searching' 
-              AND user_id != ? 
-              AND (target_gender = 'any' OR target_gender = ?)
-              AND (? = 'any' OR gender = ?)
-            LIMIT 1
-        )
-        RETURNING user_id
-    """
-    
-    # ЧТЕНИЕ (UPDATE ... RETURNING работает как SELECT, он возвращает данные)
-    async with db_conn.execute(query, (user_id, user_id, u_gender, u_target, u_target)) as cursor:
+    # 2. Пытаемся найти подходящего собеседника
+    # Логика: ищем кого-то в поиске, кто подходит нам, и кому подходим мы
+    async with db_conn.execute("""
+        SELECT user_id FROM users 
+        WHERE status = 'searching' 
+        AND user_id != ? 
+        AND (target_gender = 'any' OR target_gender = ?)
+        AND (gender = ? OR ? = 'any')
+        LIMIT 1
+    """, (user_id, u_gender, u_target, u_gender)) as cursor:
         opponent = await cursor.fetchone()
 
     if opponent:
         opponent_id = opponent[0]
         
-        # ЗАПИСЬ (UPDATE) - просто выполняем запрос и делаем commit
-        await db_conn.execute(
-            "UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", 
-            (opponent_id, user_id)
-        )
+        # 3. Соединяем обоих (обновляем обоих в одной транзакции)
+        await db_conn.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (opponent_id, user_id))
+        await db_conn.execute("UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", (user_id, opponent_id))
         await db_conn.commit()
 
         await message.answer("🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
-        await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
+        try:
+            await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
+        except Exception:
+            pass # Если бот не может написать оппоненту
     else:
-        # ЗАПИСЬ (UPDATE) - встаем в поиск
+        # 4. Если никого нет, встаем в очередь
         await db_conn.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
         await db_conn.commit()
         await message.answer("🔍 Ищем собеседника... Пожалуйста, подожди.", reply_markup=get_search_menu())
-
 
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ ---
 @router.message(F.text == "🏁 Завершить игру")
@@ -811,57 +803,17 @@ async def verify_cat_photo(callback: CallbackQuery):
     file_unique_id = data_parts[3]
     file_id = data_parts[4] if len(data_parts) > 4 else None
     
-    if action == "yes":
-        # Используем асинхронный контекстный менеджер
-        async with db_conn.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,)) as cursor:
-            if await cursor.fetchone():
-                await bot.send_message(sender_id, "❌ Это фото кота уже использовалось в игре!")
-                await callback.message.answer("Это фото уже было засчитано ранее.")
-                return
-
-        # Асинхронные вставки и обновления
-        await db_conn.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, sender_id))
-        await db_conn.execute(
-            "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
-            (sender_id,)
-        )
-        await db_conn.commit()
-
-        # Асинхронное получение данных
-        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,)) as cursor:
-            row = await cursor.fetchone()
-            sender_score = row[0] if row else 0
-
-        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (callback.from_user.id,)) as cursor:
-            row = await cursor.fetchone()
-            my_score = row[0] if row else 0
-
-        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил котика! Твой счет: {sender_score}")
-        await callback.message.answer(f"✅ Засчитано! Счет собеседника: {sender_score} 🐈\nТвой счет: {my_score}")
-
-    elif action == "no":
-        await bot.send_message(sender_id, "📸 Собеседник отметил твое фото как обычный снимок.")
-        await callback.message.answer("Принято!")
-
-    elif action == "report":
-        # ... ваша логика репорта ...
-        pass
-
-    await callback.answer()
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except:
-        pass
-
-    # Используем асинхронный контекстный менеджер для всех операций
-    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (sender_id,)) as cursor:
+    # 1. Сначала проверяем, актуальна ли еще игра
+    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (sender_id,)) as cursor:
         sender_data = await cursor.fetchone()
     
     if not sender_data or sender_data[0] != 'playing':
-        if action != "report":
+        if action != "report": # Репорты можно слать и после игры
             await callback.message.answer("⚠️ Эта игра уже завершена.")
+            await callback.answer()
             return
 
+    # 2. Выполняем действие
     if action == "yes":
         # Проверка на повторное использование
         async with db_conn.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,)) as cursor:
@@ -870,7 +822,7 @@ async def verify_cat_photo(callback: CallbackQuery):
                 await callback.message.answer("Это фото уже было засчитано ранее.")
                 return
 
-        # Запись фото и начисление баллов (в одной транзакции)
+        # Начисление баллов
         await db_conn.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, sender_id))
         await db_conn.execute(
             "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
@@ -880,14 +832,14 @@ async def verify_cat_photo(callback: CallbackQuery):
 
         # Получение обновленных баллов
         async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,)) as cursor:
-            s_score = await cursor.fetchone()
-            sender_score = s_score[0] if s_score else 0
+            row = await cursor.fetchone()
+            sender_score = row[0] if row else 0
 
         async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (callback.from_user.id,)) as cursor:
-            m_score = await cursor.fetchone()
-            my_score = m_score[0] if m_score else 0
+            row = await cursor.fetchone()
+            my_score = row[0] if row else 0
 
-        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил твоего котика! Твой счет: {sender_score}")
+        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил котика! Твой счет: {sender_score}")
         await callback.message.answer(f"✅ Засчитано! У собеседника теперь {sender_score} 🐈\nТвой счет: {my_score}")
 
     elif action == "no":
@@ -896,23 +848,29 @@ async def verify_cat_photo(callback: CallbackQuery):
 
     elif action == "report":
         await bot.send_message(sender_id, "⚠️ На ваше фото поступила жалоба. Ожидайте решения модератора.")
-        await callback.message.answer("🚨 Жалоба успешно отправлена администратору. Спасибо за бдительность!")
+        await callback.message.answer("🚨 Жалоба успешно отправлена администратору.")
 
-        if MODERATION_CHAT_ID and file_id: # Проверяем, что ID есть
+        if MODERATION_CHAT_ID and file_id:
             try:
                 await bot.send_photo(
                     MODERATION_CHAT_ID,
-                    file_id,  # <--- ИСПОЛЬЗУЕМ ПЕРЕДАННЫЙ ID
-                    caption=(
-                        f"🚨 <b>ЖАЛОБА НА ФОТО (НСФВ/Спам)</b>\n"
-                        f"Нарушитель ID: <code>{sender_id}</code>\n"
-                        f"Жалуется ID: <code>{callback.from_user.id}</code>\n"
-                    ),
+                    file_id,
+                    caption=(f"🚨 <b>ЖАЛОБА НА ФОТО</b>\nНарушитель: <code>{sender_id}</code>\n"
+                             f"Жалуется: <code>{callback.from_user.id}</code>"),
                     reply_markup=get_moderation_kb(sender_id),
                     parse_mode="HTML"
                 )
             except Exception as e:
-                logging.error(f"Ошибка отправки жалобы на фото: {e}")
+                logging.error(f"Ошибка отправки жалобы: {e}")
+
+    # 3. Финализируем
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+    
 
 
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
@@ -974,11 +932,6 @@ async def handle_chat_and_media(message: Message):
         return
 
     if message.text:
-        # Игнорируем кнопки, если они случайно проскочили
-        if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль", "🏁 Завершить игру", "🚨 Пожаловаться на собеседника"]:
-            return
-        
-        # АСИНХРОННАЯ ЗАПИСЬ
         await db_conn.execute("INSERT INTO chat_history (sender_id, receiver_id, text) VALUES (?, ?, ?)", 
                              (user_id, opponent_id, message.text))
         await db_conn.commit()
