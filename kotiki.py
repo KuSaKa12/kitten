@@ -703,7 +703,7 @@ async def process_confirm_exit(callback: CallbackQuery):
     if action == "yes":
         opponent_id = res[1]
         
-       async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
             my_score = await cursor.fetchone()[0]
 
         async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,)) as cursor:
