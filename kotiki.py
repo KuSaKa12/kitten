@@ -13,6 +13,27 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKe
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram import BaseMiddleware
+
+class BanCheckMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user_id = event.from_user.id
+        
+        # Проверяем базу данных
+        async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
+            if await cursor.fetchone():
+                # Если пользователь в бане — просто блокируем событие
+                if isinstance(event, Message):
+                    await event.answer("🚫 Вы заблокированы.")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("🚫 Вы заблокированы.", show_alert=True)
+                return # Прерываем цепочку, событие не дойдет до хендлеров
+
+        # Если не в бане — продолжаем выполнение
+        return await handler(event, data)
+
+
+
 
 CHANNEL_ID = "@ITkaktusik"
 db_path = "/app/data/cat_game.db"
@@ -940,9 +961,14 @@ async def handle_chat_and_media(message: Message):
 
 
 async def main():
-    await init_db()  # <--- Бот сначала создаст базу
+    await init_db()  # Сначала создаем базу
+    
+    # Регистрация Middleware в диспетчере
+    # Это перехватывает все обновления (сообщения, нажатия кнопок) до их обработки
+    dp.update.middleware(BanCheckMiddleware())
+    
     dp.include_router(router)
-    await dp.start_polling(bot) # <--- Потом начнет работать
+    await dp.start_polling(bot) # Только потом начинаем работу
 
 if __name__ == "__main__":
     asyncio.run(main())
