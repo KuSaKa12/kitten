@@ -1,3 +1,4 @@
+import html
 import aiosqlite
 import socket
 import sys
