@@ -923,7 +923,7 @@ async def handle_chat_and_media(message: Message):
         )
         return
 
-   if message.text:
+    if message.text:
         # Игнорируем кнопки, если они случайно проскочили
         if message.text in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль", "🏁 Завершить игру", "🚨 Пожаловаться на собеседника"]:
             return
