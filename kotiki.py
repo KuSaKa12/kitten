@@ -986,7 +986,7 @@ async def main():
     
     # 1. Сначала добавляем все роутеры
     dp.include_router(router)
-    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     # 2. Только потом вешаем Middleware
     dp.update.middleware(BanCheckMiddleware())
     
