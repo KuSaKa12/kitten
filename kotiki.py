@@ -982,12 +982,23 @@ async def handle_chat_and_media(message: Message):
 
 
 async def main():
+    # 1. Сначала логирование
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # 2. Инициализация БД
     await init_db()
     
-    # 1. Сначала добавляем все роутеры
+    # 3. Регистрация всего (роутеры, мидлвары)
     dp.include_router(router)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    # 2. Только потом вешаем Middleware
     dp.update.middleware(BanCheckMiddleware())
     
+    # 4. Запуск (delete_webhook нужен, чтобы сбросить старые зависшие запросы)
+    logging.info("Бот запущен!")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот выключен")
