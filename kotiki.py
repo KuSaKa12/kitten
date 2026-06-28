@@ -17,23 +17,29 @@ from aiogram import BaseMiddleware
 
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        # Проверяем, есть ли у события атрибут from_user
+        # 1. Безопасно получаем пользователя
         user = event.from_user if hasattr(event, "from_user") else None
         
-        # Если пользователя нет (техническое обновление), просто пропускаем его дальше
+        # 2. Проверяем, является ли это командой /delete_data
+        # Если это сообщение и текст "/delete_data" — разрешаем проход дальше
+        if isinstance(event, Message) and event.text == "/delete_data":
+            return await handler(event, data)
+
+        # 3. Если пользователя нет — пропускаем
         if user is None:
             return await handler(event, data)
         
         user_id = user.id
         
-        # Проверяем базу данных
+        # 4. Проверяем бан
         async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
             if await cursor.fetchone():
+                # Если в бане — блокируем все, кроме /delete_data (которая уже прошла проверку выше)
                 if isinstance(event, Message):
-                    await event.answer("🚫 Вы заблокированы.")
+                    await event.answer("🚫 Вы заблокированы. Вы можете использовать только команду /delete_data, чтобы удалить свой профиль.")
                 elif isinstance(event, CallbackQuery):
                     await event.answer("🚫 Вы заблокированы.", show_alert=True)
-                return # Прерываем цепочку
+                return 
 
         return await handler(event, data)
 
