@@ -670,6 +670,7 @@ async def ask_end_game(message: Message):
 
 
 # --- ЖАЛОБА НА СОБЕСЕДНИКА ВО ВРЕМЯ ИГРЫ (ТОКСИЧНОСТЬ) ---
+# --- ЖАЛОБА НА СОБЕСЕДНИКА ВО ВРЕМЯ ИГРЫ (ТОКСИЧНОСТЬ) ---
 @router.message(F.text == "🚨 Пожаловаться на собеседника")
 async def report_player_chat(message: Message):
     user_id = message.from_user.id
@@ -682,7 +683,6 @@ async def report_player_chat(message: Message):
     opponent_id = res[1]
     time_limit = (datetime.now() - timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
     
-    # ИСПОЛЬЗУЕМ async with cursor КАК В ДРУГИХ МЕСТАХ
     async with db_conn.execute("""
         SELECT sender_id, text, timestamp FROM chat_history
         WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
@@ -695,12 +695,18 @@ async def report_player_chat(message: Message):
     for sender, txt, ts in history:
         name = "Нарушитель" if sender == opponent_id else "Жалующийся"
         time_str = ts.split(" ")[1] if " " in ts else ts
-        history_text += f"[{time_str}] {name}: {txt}\n"
+        
+        # === ГЛАВНЫЙ ФИКС ===
+        # Экранируем текст: превращаем символы < и > в безопасные, чтобы не ломался parse_mode="HTML"
+        safe_txt = html.escape(str(txt)) if txt else "[Медиа/Пусто]"
+        
+        history_text += f"[{time_str}] {name}: {safe_txt}\n"
 
     if not history_text:
         history_text = "<i>Сообщений за последние 20 минут в текстовом виде нет.</i>"
     elif len(history_text) > 3000:
-        history_text = history_text[-3000:] 
+        # Добавляем многоточие, чтобы было понятно, что история обрезана
+        history_text = "...\n" + history_text[-3000:] 
 
     report_msg = (
         f"🚨 <b>ЖАЛОБА НА ОБЩЕНИЕ (Токсичность / Спам)</b>\n\n"
@@ -719,9 +725,10 @@ async def report_player_chat(message: Message):
         )
         await message.answer("🚨 Твоя жалоба и история чата успешно отправлены модераторам. Спасибо!")
     except Exception as e:
+        # Теперь, если ошибка всё же произойдет (например, бота удалили из чата админов), 
+        # она будет записана в логи, и вы сможете ее увидеть в консоли.
         logging.error(f"Ошибка при отправке логов чата модераторам: {e}")
-        await message.answer("❌ Произошла ошибка при отправке репорта.")
-
+        await message.answer("❌ Произошла ошибка при отправке репорта. Свяжитесь с администрацией.")
 
 # --- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ВЫХОДА ---
 @router.callback_query(F.data.startswith("confirm_exit_"))
