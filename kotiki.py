@@ -60,8 +60,33 @@ db_conn = None
 
 async def init_db():
     global db_conn
-    # Открываем базу асинхронно
     db_conn = await aiosqlite.connect(db_path)
+    
+    # --- НАЧАЛО ТЕСТА RETURNING ---
+    logging.info("=== Проверка поддержки RETURNING ===")
+    try:
+        # Создадим временную таблицу только для теста
+        await db_conn.execute("CREATE TABLE IF NOT EXISTS _test_ret (id INTEGER PRIMARY KEY, val TEXT)")
+        await db_conn.execute("INSERT OR IGNORE INTO _test_ret (id, val) VALUES (1, 'old')")
+        
+        # Пробуем UPDATE ... RETURNING
+        async with db_conn.execute(
+            "UPDATE _test_ret SET val = 'new' WHERE id = 1 RETURNING id, val"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        
+        logging.info(f"RETURNING вернул строки: {rows}")
+        if rows:
+            logging.info("✅ RETURNING работает: получил данные.")
+        else:
+            logging.info("⚠️ RETURNING выполнился без ошибок, но вернул пустой список.")
+    except Exception as e:
+        logging.error(f"❌ RETURNING НЕ работает: ошибка SQL — {e}")
+    
+    # Удаляем тестовую таблицу
+    await db_conn.execute("DROP TABLE IF EXISTS _test_ret")
+    await db_conn.commit()
+    # --- КОНЕЦ ТЕСТА ---
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS banned_users (
         user_id INTEGER PRIMARY KEY
@@ -80,11 +105,15 @@ async def init_db():
         current_opponent INTEGER DEFAULT NULL
     )''')
     
+    
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS cat_photos (
         file_unique_id TEXT PRIMARY KEY,
-        user_id INTEGER
-    )''')
+        user_id INTEGER,
+        uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
     
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS chat_history (
@@ -472,6 +501,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "Мы за позитив! Токсичность, травля и оскорбления недопустимы. Собеседник — тоже человек.\n\n"
         "🌟 <b>5. Больше разнообразия</b>\n"
         "Один ракурс — один котик. Не спамь одним и тем же снимком, покажи пушистого во всей красе!\n\n"
+        "⚠️ Регистрация от 14 лет. Для пользователей 14–17 лет нужно согласие родителей.\n\n"
         "👇 <i>Нажимая кнопку ниже, ты подтверждаешь, что принимаешь <a href='ССЫЛКА_НА_СОГЛАШЕНИЕ'>Пользовательское соглашение</a> и <a href='ССЫЛКА_НА_ПОЛИТИКУ'>Политику конфиденциальности</a>, и готов(а) соблюдать правила сервиса!</i>"
     )
     await message.answer(
@@ -806,6 +836,22 @@ async def show_leaderboard(message: Message):
     
     await message.answer(text, parse_mode="HTML")
 
+async def cleanup_old_photos():
+    # Удаляем фото, загруженные более 180 дней назад
+    await db_conn.execute(
+        "DELETE FROM cat_photos WHERE uploaded_at < datetime('now', '-180 days')"
+    )
+    await db_conn.commit()
+    logging.info("Очистка старых фото (старше 180 дней) завершена.")
+
+
+async def periodic_cleanup():
+    while True:
+        try:
+            await cleanup_old_photos()
+        except Exception as e:
+            logging.error(f"Ошибка периодической очистки: {e}")
+        await asyncio.sleep(86400)
 
 # --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
 @router.callback_query(F.data.startswith("check_cat:"))
@@ -834,9 +880,14 @@ async def verify_cat_photo(callback: CallbackQuery):
                 await bot.send_message(sender_id, "❌ Это фото кота уже использовалось в игре! Балл не засчитан.")
                 await callback.message.answer("Это фото уже было засчитано ранее.")
                 return
+            
+        await db_conn.execute(
+            "INSERT OR REPLACE INTO cat_photos (file_unique_id, user_id, uploaded_at) VALUES (?, ?, ?)",
+            (file_unique_id, sender_id, datetime.now())
+        )
+        await db_conn.commit()
 
         # Начисление баллов
-        await db_conn.execute("INSERT INTO cat_photos (file_unique_id, user_id) VALUES (?, ?)", (file_unique_id, sender_id))
         await db_conn.execute(
             "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
             (sender_id,)
@@ -961,15 +1012,24 @@ async def main():
     
     # 2. Инициализация БД
     await init_db()
+    await cleanup_old_photos()
     
     # 3. Регистрация всего (роутеры, мидлвары)
     dp.include_router(router)
     dp.update.middleware(BanCheckMiddleware())
-    
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     # 4. Запуск (delete_webhook нужен, чтобы сбросить старые зависшие запросы)
     logging.info("Бот запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Корректно останавливаем фоновую задачу при выключении бота
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     try:
