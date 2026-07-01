@@ -143,8 +143,7 @@ def get_delete_confirm_kb():
     
 def get_age_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Меньше 12 лет"), KeyboardButton(text="12 - 14 лет")],
-        [KeyboardButton(text="15 - 17 лет"), KeyboardButton(text="18 лет и старше")]
+        [KeyboardButton(text="14 - 17 лет"), KeyboardButton(text="18 лет и старше")]
     ], resize_keyboard=True, one_time_keyboard=True)
 
 def get_rules_inline_kb():
@@ -528,7 +527,7 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
 # --- ПРОЦЕСС РЕГИСТРАЦИИ ---
 @router.message(Registration.waiting_for_age)
 async def process_age(message: Message, state: FSMContext):
-    valid_ages = ["Меньше 12 лет", "12 - 14 лет", "15 - 17 лет", "18 лет и старше"]
+    valid_ages = ["14 - 17 лет", "18 лет и старше"]
     
     if message.text not in valid_ages:
         await message.answer("Пожалуйста, выбери вариант на клавиатуре!")
