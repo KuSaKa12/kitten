@@ -675,7 +675,8 @@ async def ask_end_game(message: Message):
 
 
 # --- ЖАЛОБА НА СОБЕСЕДНИКА ВО ВРЕМЯ ИГРЫ (ТОКСИЧНОСТЬ) ---
-# --- ЖАЛОБА НА СОБЕСЕДНИКА ВО ВРЕМЯ ИГРЫ (ТОКСИЧНОСТЬ) ---
+
+
 @router.message(F.text == "🚨 Пожаловаться на собеседника")
 async def report_player_chat(message: Message):
     user_id = message.from_user.id
@@ -857,7 +858,7 @@ async def verify_cat_photo(callback: CallbackQuery):
                 return
             
         await db_conn.execute(
-            "INSERT OR REPLACE INTO cat_photos (file_unique_id, user_id, uploaded_at) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO cat_photos (file_unique_id, user_id, uploaded_at) VALUES (?, ?, ?)",
             (file_unique_id, sender_id, datetime.now())
         )
         await db_conn.commit()
