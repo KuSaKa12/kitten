@@ -62,31 +62,6 @@ async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(db_path)
     
-    # --- НАЧАЛО ТЕСТА RETURNING ---
-    logging.info("=== Проверка поддержки RETURNING ===")
-    try:
-        # Создадим временную таблицу только для теста
-        await db_conn.execute("CREATE TABLE IF NOT EXISTS _test_ret (id INTEGER PRIMARY KEY, val TEXT)")
-        await db_conn.execute("INSERT OR IGNORE INTO _test_ret (id, val) VALUES (1, 'old')")
-        
-        # Пробуем UPDATE ... RETURNING
-        async with db_conn.execute(
-            "UPDATE _test_ret SET val = 'new' WHERE id = 1 RETURNING id, val"
-        ) as cursor:
-            rows = await cursor.fetchall()
-        
-        logging.info(f"RETURNING вернул строки: {rows}")
-        if rows:
-            logging.info("✅ RETURNING работает: получил данные.")
-        else:
-            logging.info("⚠️ RETURNING выполнился без ошибок, но вернул пустой список.")
-    except Exception as e:
-        logging.error(f"❌ RETURNING НЕ работает: ошибка SQL — {e}")
-    
-    # Удаляем тестовую таблицу
-    await db_conn.execute("DROP TABLE IF EXISTS _test_ret")
-    await db_conn.commit()
-    # --- КОНЕЦ ТЕСТА ---
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS banned_users (
         user_id INTEGER PRIMARY KEY
