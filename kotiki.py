@@ -100,6 +100,13 @@ async def init_db():
     )''')
     
     await db_conn.commit()
+    
+    await db_conn.execute('''
+        ALTER TABLE users
+        ADD COLUMN consent_policy_version TEXT DEFAULT NULL,
+        ADD COLUMN consent_timestamp DATETIME DEFAULT NULL
+    ''')
+    await db_conn.commit()
 
 # Настройки для Windows
 if sys.platform == 'win32':
@@ -517,12 +524,44 @@ async def change_profile(message: Message, state: FSMContext):
 
 @router.callback_query(Registration.waiting_for_rules, F.data == "start_registration")
 async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    policy_version = "v1.2"
+    now = datetime.now()
+
+    # Сначала проверяем, есть ли пользователь в базе
+    async with db_conn.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        row = await cursor.fetchone()
+
+    if row is None:
+        # Если пользователя нет — делаем INSERT с минимально нужными полями
+        await db_conn.execute(
+            """
+            INSERT INTO users (
+                user_id, username, consent_policy_version, consent_timestamp
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (user_id, callback.from_user.username or f"User_{user_id}", policy_version, now)
+        )
+    else:
+        # Если пользователь уже есть — делаем UPDATE только по полям согласия
+        await db_conn.execute(
+            """
+            UPDATE users
+            SET consent_policy_version = ?, consent_timestamp = ?
+            WHERE user_id = ?
+            """,
+            (policy_version, now, user_id)
+        )
+
+    await db_conn.commit()
+
     try:
         await callback.message.delete()
-    except:
+    except Exception:
         pass
+
     await callback.message.answer(
-        "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:", 
+        "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:",
         reply_markup=get_age_kb()
     )
     await state.set_state(Registration.waiting_for_age)
