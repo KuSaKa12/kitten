@@ -101,9 +101,15 @@ async def init_db():
     
     await db_conn.commit()
     
+
     await db_conn.execute('''
         ALTER TABLE users
-        ADD COLUMN consent_policy_version TEXT DEFAULT NULL,
+        ADD COLUMN consent_policy_version TEXT DEFAULT NULL
+    ''')
+    await db_conn.commit()
+    
+    await db_conn.execute('''
+        ALTER TABLE users
         ADD COLUMN consent_timestamp DATETIME DEFAULT NULL
     ''')
     await db_conn.commit()
