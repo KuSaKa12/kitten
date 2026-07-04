@@ -865,25 +865,45 @@ async def periodic_cleanup():
 
 # --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
 @router.callback_query(F.data.startswith("check_cat:"))
-async def verify_cat_photo(callback: CallbackQuery):
-    data_parts = callback.data.split(":")
-    action = data_parts[1]
-    sender_id = int(data_parts[2])
-    file_unique_id = data_parts[3]
-    file_id = data_parts[4] if len(data_parts) > 4 else None
-    
-    # 1. Сначала проверяем, актуальна ли еще игра
-    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (sender_id,)) as cursor:
-        sender_data = await cursor.fetchone()
-    
-    if not sender_data or sender_data[0] != 'playing':
-        if action != "report": # Репорты можно слать и после игры
-            await callback.message.answer("⚠️ Эта игра уже завершена.")
-            await callback.answer()
-            return
+async def process_cat_check(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    # parts: ['check_cat', 'yes/no/report', user_id, file_unique_id]
+    if len(parts) < 4:
+        await callback.answer("Ошибка данных кнопки", show_alert=True)
+        return
 
-    # 2. Выполняем действие
-    if action == "yes":
+    action = parts[1]          # yes / no / report
+    sender_id = int(parts[2])
+    file_unique_id = parts[3]
+
+    # Достаём file_id из БД по file_unique_id
+    async with db_conn.execute(
+        "SELECT file_id FROM cat_photos WHERE file_unique_id = ?",
+        (file_unique_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    if not row:
+        await callback.answer("Фото не найдено в базе", show_alert=True)
+        return
+
+    file_id = row[0]
+
+    # Дальше логика по action:
+    if action == "report":
+        # Отправляем фото админу с пометкой о жалобе
+        await bot.send_photo(
+            chat_id=MODERATION_CHAT_ID,
+            photo=file_id,
+            caption=(
+                f"🚨 Жалоба на фото!\n"
+                f"От пользователя: {sender_id}\n"
+                f"file_unique_id: {file_unique_id}"
+            )
+        )
+        await callback.answer("Жалоба отправлена модераторам.")
+        # Тут можно сохранить запись о жалобе в отдельную таблицу reports
+    elif action == "yes":
         # Проверка на повторное использование
         async with db_conn.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,)) as cursor:
             if await cursor.fetchone():
