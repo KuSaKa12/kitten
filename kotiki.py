@@ -483,7 +483,8 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         rules_text, 
         reply_markup=get_rules_inline_kb(), 
-        parse_mode="HTML"
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
     await state.set_state(Registration.waiting_for_rules)
 
