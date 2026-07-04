@@ -990,7 +990,7 @@ async def handle_chat_and_media(message: Message):
             ],
             [
                 # Сюда добавляем :file_id в конец строки
-                InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}:{file_id}")
+                InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}")
             ]
         ])
 
