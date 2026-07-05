@@ -66,7 +66,8 @@ async def init_db():
     CREATE TABLE IF NOT EXISTS banned_users (
         user_id INTEGER PRIMARY KEY
     )''')
-    # Создаем таблицы (все сразу здесь)
+    
+    # ТОЛЬКО изначальные колонки (без consent_policy_version и consent_timestamp)
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -77,10 +78,8 @@ async def init_db():
         status TEXT DEFAULT 'idle', 
         current_match_cats INTEGER DEFAULT 0, 
         total_cats INTEGER DEFAULT 0,         
-        current_opponent INTEGER DEFAULT NULL,
-        consent_policy_version TEXT DEFAULT NULL
+        current_opponent INTEGER DEFAULT NULL
     )''')
-    
     
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS cat_photos (
@@ -90,7 +89,6 @@ async def init_db():
         user_id INTEGER NOT NULL,
         uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
-    
     
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS chat_history (
@@ -267,6 +265,24 @@ async def perform_ban(target_id: int):
         )
     except Exception as e:
         logging.warning(f"Не удалось отправить сообщение о бане пользователю {target_id}: {e}")
+
+
+
+async def migrate_users_table(db_path: str):
+    async with aiosqlite.connect(db_path) as db:
+        # Проверяем, какие колонки уже есть
+        async with db.execute("PRAGMA table_info(users)") as cursor:
+            cols = [row[1] for row in await cursor.fetchall()]
+        
+        if "consent_policy_version" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN consent_policy_version TEXT")
+        
+        if "consent_timestamp" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN consent_timestamp DATETIME")
+        
+        await db.commit()
+        logging.info("✅ Миграция таблицы users завершена.")
+
 
 
 # Команда для удаления данных
@@ -1056,7 +1072,10 @@ async def main():
 
     global db_conn
     db_conn = await aiosqlite.connect(db_path)
-    await init_db()  # только CREATE TABLE IF NOT EXISTS, без повторных подключений
+    await init_db()
+    
+    # Сначала миграции, потом остальное
+    await migrate_users_table(db_path)
 
     await cleanup_old_photos()
 
