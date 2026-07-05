@@ -77,7 +77,7 @@ async def init_db():
         status TEXT DEFAULT 'idle', 
         current_match_cats INTEGER DEFAULT 0, 
         total_cats INTEGER DEFAULT 0,         
-        current_opponent INTEGER DEFAULT NULL
+        current_opponent INTEGER DEFAULT NULL,
         consent_policy_version TEXT DEFAULT NULL
     )''')
     
