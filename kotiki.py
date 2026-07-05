@@ -18,30 +18,32 @@ from aiogram import BaseMiddleware
 
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        if db_conn is None:
+            # Если БД ещё не подключена — не блокируем, а логируем и пропускаем
+            logging.warning("Middleware: БД ещё не инициализирована, пропускаем проверку бана.")
+            return await handler(event, data)
+
         user = event.from_user if hasattr(event, "from_user") else None
-        
         if user is None:
             return await handler(event, data)
-        
-        # Проверяем наличие пользователя в таблице банов
-        async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user.id,)) as cursor:
+
+        async with db_conn.execute(
+            "SELECT user_id FROM banned_users WHERE user_id = ?",
+            (user.id,)
+        ) as cursor:
             is_banned = await cursor.fetchone()
 
         if is_banned:
-            # Разрешаем команду /delete_data
             if isinstance(event, Message) and event.text == "/delete_data":
                 return await handler(event, data)
-            
-            # Разрешаем нажатие на кнопки "Да/Нет" при удалении данных
             if isinstance(event, CallbackQuery) and event.data.startswith("delete_confirm_"):
                 return await handler(event, data)
 
-            # Блокируем ВСЁ остальное
             if isinstance(event, Message):
                 await event.answer("🚫 Вы заблокированы. Вы можете использовать только команду /delete_data, чтобы удалить свои данные.")
             elif isinstance(event, CallbackQuery):
                 await event.answer("🚫 Вы заблокированы.", show_alert=True)
-            return # Прерываем выполнение
+            return
 
         return await handler(event, data)
 
@@ -59,9 +61,6 @@ os.makedirs(os.path.dirname(db_path), exist_ok=True)
 db_conn = None
 
 async def init_db():
-    global db_conn
-    db_conn = await aiosqlite.connect(db_path)
-    
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS banned_users (
         user_id INTEGER PRIMARY KEY
@@ -78,8 +77,11 @@ async def init_db():
         status TEXT DEFAULT 'idle', 
         current_match_cats INTEGER DEFAULT 0, 
         total_cats INTEGER DEFAULT 0,         
-        current_opponent INTEGER DEFAULT NULL
+        current_opponent INTEGER DEFAULT NULL,
+        consent_policy_version TEXT,
+        consent_timestamp DATETIME
     )''')
+
     
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS cat_photos (
@@ -102,6 +104,8 @@ async def init_db():
     await db_conn.commit()
 
 
+dp.update.middleware(BanCheckMiddleware())
+
 # Настройки для Windows
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -113,7 +117,7 @@ if sys.platform == 'win32':
 
     socket.getaddrinfo = new_getaddrinfo
 
-logging.basicConfig(level=logging.INFO)
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов (баги/предложения)
@@ -233,30 +237,42 @@ async def cmd_ban(message: Message, command: CommandObject):
     await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
 
 async def perform_ban(target_id: int):
-    # 1. Сначала узнаем ID оппонента
+    # 1. Узнаём ID оппонента
     async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,)) as cursor:
         res = await cursor.fetchone()
     
     if res and res[0]:
         opp_id = res[0]
-        await db_conn.execute("UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?", (opp_id,))
+
+        # === УДАЛЕНИЕ ИСТОРИИ ЧАТА МЕЖДУ НИМИ ===
+        await db_conn.execute(
+            "DELETE FROM chat_history "
+            "WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)",
+            (target_id, opp_id, opp_id, target_id)
+        )
+
+        # Сбрасываем статус оппонента
+        await db_conn.execute(
+            "UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?",
+            (opp_id,)
+        )
+        await db_conn.commit()
+        
         try:
             await bot.send_message(
                 opp_id, 
                 "🚨 Твой собеседник был заблокирован администратором за нарушение правил. Игра завершена.", 
                 reply_markup=get_main_menu()
             )
-        except:
-            pass
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить оппонента {opp_id} о бане: {e}")
 
-    # === ГЛАВНЫЙ ФИКС ===
-    # 1. Заносим в таблицу вечных банов
+    # 2. Сам бан: в таблицу banned_users и обновление статуса
     await db_conn.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (target_id,))
-    # 2. Меняем статус в обычной таблице
     await db_conn.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
     await db_conn.commit() 
 
-    # Уведомляем самого нарушителя
+    # Уведомление нарушителю
     try:
         await bot.send_message(
             target_id,
@@ -265,23 +281,6 @@ async def perform_ban(target_id: int):
         )
     except Exception as e:
         logging.warning(f"Не удалось отправить сообщение о бане пользователю {target_id}: {e}")
-
-
-
-async def migrate_users_table(db_path: str):
-    async with aiosqlite.connect(db_path) as db:
-        # Проверяем, какие колонки уже есть
-        async with db.execute("PRAGMA table_info(users)") as cursor:
-            cols = [row[1] for row in await cursor.fetchall()]
-        
-        if "consent_policy_version" not in cols:
-            await db.execute("ALTER TABLE users ADD COLUMN consent_policy_version TEXT")
-        
-        if "consent_timestamp" not in cols:
-            await db.execute("ALTER TABLE users ADD COLUMN consent_timestamp DATETIME")
-        
-        await db.commit()
-        logging.info("✅ Миграция таблицы users завершена.")
 
 
 
@@ -458,29 +457,35 @@ async def process_report(message: Message, state: FSMContext):
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    # 1. ПРОВЕРКА НА БАН (по новой таблице)
+    # Проверка бана (как у тебя)
     async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
         if await cursor.fetchone():
             await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
             return
 
-    # 2. Обычная проверка статуса
     async with db_conn.execute("SELECT age_category, status FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
-    # (Опционально: можно оставить проверку статуса, если бан еще есть в таблице users)
     if res and res[1] == 'banned':
         await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
         return
 
-    # 3. Сброс игры, если пользователь уже зарегистрирован
+    # Если пользователь был в игре/поиске — сбрасываем статус
     if res and res[0] is not None:
         await db_conn.execute(
             "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?",
             (user_id,)
         )
+
+        # === УДАЛЕНИЕ ВСЕЙ ИСТОРИИ ДЛЯ ЭТОГО ПОЛЬЗОВАТЕЛЯ ===
+        # Это соответствует твоей политике: сессия завершена, данные не храним
+        await db_conn.execute(
+            "DELETE FROM chat_history WHERE sender_id = ? OR receiver_id = ?",
+            (user_id, user_id)
+        )
         await db_conn.commit()
 
+    # Дальше как у тебя: правила и клавиатура
     rules_text = (
         "🐾 <b>Добро пожаловать в «котоLOVе»!</b>\n"
         "<i>Твой уютный уголок для знакомств, общения и поиска друзей через любовь к хвостикам.</i> 🐈\n\n"
@@ -622,18 +627,32 @@ async def process_target_gender(message: Message, state: FSMContext):
         target_val = "female"
 
     user_data = await state.get_data()
-    user_id = message.from_user.id
-    username = message.from_user.username or f"User_{user_id}"
+user_id = message.from_user.id
+username = message.from_user.username or f"User_{user_id}"
 
-    async with db_conn.execute("SELECT total_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        old_total = await cursor.fetchone()
-    total_cats_to_save = old_total[0] if old_total else 0
+target_val = "any"
+if message.text == "Парня":
+    target_val = "male"
+elif message.text == "Девушку":
+    target_val = "female"
 
-    await db_conn.execute('''
-        INSERT OR REPLACE INTO users (user_id, username, age_category, gender, target_gender, status, current_match_cats, total_cats)
-        VALUES (?, ?, ?, ?, ?, 'idle', 0, ?)
-    ''', (user_id, username, user_data['age_category'], user_data['gender'], target_val, total_cats_to_save))
-    await db_conn.commit()
+# Сначала читаем total_cats, чтобы не потерять счётчик
+async with db_conn.execute("SELECT total_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    row = await cursor.fetchone()
+total_cats_to_save = row[0] if row else 0
+
+await db_conn.execute('''
+    UPDATE users
+    SET username = ?,
+        age_category = ?,
+        gender = ?,
+        target_gender = ?,
+        status = 'idle',
+        current_match_cats = 0,
+        total_cats = ?
+    WHERE user_id = ?
+''', (username, user_data['age_category'], user_data['gender'], target_val, total_cats_to_save, user_id))
+await db_conn.commit()
 
     await state.clear()
     await message.answer(
@@ -797,48 +816,47 @@ async def report_player_chat(message: Message):
 async def process_confirm_exit(callback: CallbackQuery):
     user_id = callback.from_user.id
     action = callback.data.split("_")[-1]
+    
+    if action == "no":
+        await callback.message.edit_text("✅ Игра продолжается!")
+        await callback.answer()
+        return
 
+    # Получаем текущего оппонента
+    async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
+    if not res or not res[0]:
+        await callback.answer("Ты не в игре.", show_alert=True)
+        return
+    
+    opponent_id = res[0]
+
+    # === УДАЛЕНИЕ ИСТОРИИ ЧАТА ===
+    await db_conn.execute(
+        "DELETE FROM chat_history "
+        "WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)",
+        (user_id, opponent_id, opponent_id, user_id)
+    )
+
+    # Сбрасываем статусы обоих
+    await db_conn.execute(
+        "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
+        (user_id, opponent_id)
+    )
+    await db_conn.commit()
+
+    await callback.message.edit_text("🏁 Игра завершена.")
     await callback.answer()
 
+    # Сообщаем оппоненту
     try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        res = await cursor.fetchone()
-
-    if not res or res[0] != 'playing':
-        await bot.send_message(user_id, "Вы уже не находитесь в игре.", reply_markup=get_main_menu())
-        return
-
-    if action == "no":
-        await bot.send_message(user_id, "Отлично, продолжаем игру! Жду фото котиков.")
-        return
-
-    if action == "yes":
-        opponent_id = res[1]
-        
-        # БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ СЧЕТА (исправлен краш)
-        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            my_score = row[0] if row else 0
-
-        async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (opponent_id,)) as cursor:
-            opp_score_data = await cursor.fetchone()
-            opp_score = opp_score_data[0] if opp_score_data else 0
-
-        await db_conn.execute(
-            "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
-            (user_id, opponent_id)
+        await bot.send_message(
+            opponent_id,
+            "⚠️ Твой собеседник завершил игру.",
+            reply_markup=get_main_menu()
         )
-        await db_conn.commit()
-
-        text_for_me = f"Игра завершена!\n📊 Твой счет в этом раунде: 🐈 {my_score}\n📊 Счет собеседника: 🐈 {opp_score}"
-        text_for_opp = f"⚠️ Собеседник завершил игру.\n\nИгра завершена!\n📊 Твой счет в этом раунде: 🐈 {opp_score}\n📊 Счет собеседника: 🐈 {my_score}"
-
-        await bot.send_message(user_id, text_for_me + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
-        await bot.send_message(opponent_id, text_for_opp + "\n\nВозвращаемся в главное меню.", reply_markup=get_main_menu())
+    except Exception as e:
+        logging.warning(f"Не удалось сообщить оппоненту {opponent_id}: {e}")
 
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
@@ -874,6 +892,7 @@ async def cleanup_old_photos():
     if db_conn is None:
         logging.warning("База данных ещё не подключена, пропускаем очистку.")
         return
+
     try:
         await db_conn.execute(
             "DELETE FROM cat_photos WHERE uploaded_at < datetime('now', '-180 days')"
@@ -884,18 +903,16 @@ async def cleanup_old_photos():
         logging.error(f"Ошибка очистки старых фото: {e}")
 
 async def periodic_cleanup():
-    """Запускает очистку раз в 24 часа (86400 секунд)"""
     while True:
         try:
-            await asyncio.sleep(86400)  # Ждем 24 часа
-            await cleanup_old_photos()
+            await asyncio.sleep(86400)
+            if db_conn is not None:
+                await cleanup_old_photos()
         except asyncio.CancelledError:
-            # Корректное завершение при остановке бота
             logging.info("Задача периодической очистки остановлена.")
             break
         except Exception as e:
             logging.error(f"Критическая ошибка в цикле очистки: {e}")
-            # Не прерываем цикл полностью, пробуем снова через час
             await asyncio.sleep(3600)
 # --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
 @router.callback_query(F.data.startswith("check_cat:"))
@@ -1068,6 +1085,9 @@ async def handle_chat_and_media(message: Message):
             await bot.send_message(opponent_id, message.text)
         except Exception:
             await message.answer("Не удалось доставить сообщение собеседнику.")
+    else:
+        await message.answer("В этом режиме поддерживаются только текстовые сообщения и фото котиков.")
+    return
 
 
 
@@ -1078,8 +1098,7 @@ async def main():
     db_conn = await aiosqlite.connect(db_path)
     await init_db()
     
-    # Сначала миграции, потом остальное
-    await migrate_users_table(db_path)
+
 
     await cleanup_old_photos()
 
