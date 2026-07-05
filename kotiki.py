@@ -862,6 +862,20 @@ async def cleanup_old_photos():
     except Exception as e:
         logging.error(f"Ошибка очистки старых фото: {e}")
 
+async def periodic_cleanup():
+    """Запускает очистку раз в 24 часа (86400 секунд)"""
+    while True:
+        try:
+            await asyncio.sleep(86400)  # Ждем 24 часа
+            await cleanup_old_photos()
+        except asyncio.CancelledError:
+            # Корректное завершение при остановке бота
+            logging.info("Задача периодической очистки остановлена.")
+            break
+        except Exception as e:
+            logging.error(f"Критическая ошибка в цикле очистки: {e}")
+            # Не прерываем цикл полностью, пробуем снова через час
+            await asyncio.sleep(3600)
 # --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
 @router.callback_query(F.data.startswith("check_cat:"))
 async def process_cat_check(callback: CallbackQuery):
