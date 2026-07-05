@@ -16,6 +16,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram import BaseMiddleware
 
+
+
+
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if db_conn is None:
@@ -49,11 +52,6 @@ class BanCheckMiddleware(BaseMiddleware):
 
 
 CHANNEL_ID = "@ITkaktusik"
-db_path = "/app/data/cat_game.db"
-os.makedirs(os.path.dirname(db_path), exist_ok=True)
-
-# Глобальная переменная для базы
-# Подключение к БД
 db_path = "/app/data/cat_game.db"
 os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
@@ -125,8 +123,7 @@ ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов (ба�
 # Если не указан, упадет в личку ADMIN_ID
 MODERATION_CHAT_ID = os.getenv("MODERATION_CHAT_ID", ADMIN_ID) 
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+
 router = Router()
 
 
@@ -620,43 +617,50 @@ async def process_target_gender(message: Message, state: FSMContext):
         await message.answer("Выбери вариант на клавиатуре!")
         return
 
+    user_data = await state.get_data()
+    user_id = message.from_user.id
+    username = message.from_user.username or f"User_{user_id}"
+
     target_val = "any"
     if message.text == "Парня":
         target_val = "male"
     elif message.text == "Девушку":
         target_val = "female"
 
-    user_data = await state.get_data()
-user_id = message.from_user.id
-username = message.from_user.username or f"User_{user_id}"
+    # Читаем total_cats ДО обновления
+    async with db_conn.execute(
+        "SELECT total_cats FROM users WHERE user_id = ?",
+        (user_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+        total_cats_to_save = row[0] if row else 0
 
-target_val = "any"
-if message.text == "Парня":
-    target_val = "male"
-elif message.text == "Девушку":
-    target_val = "female"
-
-# Сначала читаем total_cats, чтобы не потерять счётчик
-async with db_conn.execute("SELECT total_cats FROM users WHERE user_id = ?", (user_id,)) as cursor:
-    row = await cursor.fetchone()
-total_cats_to_save = row[0] if row else 0
-
-await db_conn.execute('''
-    UPDATE users
-    SET username = ?,
-        age_category = ?,
-        gender = ?,
-        target_gender = ?,
-        status = 'idle',
-        current_match_cats = 0,
-        total_cats = ?
-    WHERE user_id = ?
-''', (username, user_data['age_category'], user_data['gender'], target_val, total_cats_to_save, user_id))
-await db_conn.commit()
+    await db_conn.execute(
+        """
+        UPDATE users
+        SET username = ?,
+            age_category = ?,
+            gender = ?,
+            target_gender = ?,
+            status = 'idle',
+            current_match_cats = 0,
+            total_cats = ?
+        WHERE user_id = ?
+        """,
+        (
+            username,
+            user_data['age_category'],
+            user_data['gender'],
+            target_val,
+            total_cats_to_save,
+            user_id
+        )
+    )
+    await db_conn.commit()
 
     await state.clear()
     await message.answer(
-        "🎉 Профиль успешно обновлен!\n"
+        "🎉 Профиль успешно обновлён!\n"
         "Нажми «🔍 Найти игрока», чтобы начать соревнование по новым критериям.",
         reply_markup=get_main_menu()
     )
@@ -1015,14 +1019,12 @@ async def process_cat_check(callback: CallbackQuery):
 async def handle_chat_and_media(message: Message):
     user_id = message.from_user.id
     
-    # Получаем данные пользователя
     async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
     if not res or res[0] == 'banned':
         return
 
-    # Логика для тех, кто не в игре
     if res[0] != 'playing':
         if message.photo:
             await message.answer("❌ Ты не можешь отправлять котиков просто так! Сначала нажми «🔍 Найти игрока».")
@@ -1031,15 +1033,12 @@ async def handle_chat_and_media(message: Message):
         return
 
     opponent_id = res[1]
-    
-    # Если оппонент потерян
     if not opponent_id:
         await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
         await db_conn.commit()
         await message.answer("⚠️ Ошибка: собеседник потерян. Пожалуйста, начни поиск заново.", reply_markup=get_main_menu())
         return
 
-    # Обработка фото
     if message.photo:
         photo = message.photo[-1]
         file_id = photo.file_id
@@ -1067,13 +1066,20 @@ async def handle_chat_and_media(message: Message):
     
         await message.answer("⏳ Отправил фото собеседнику на подтверждение...")
     
-        await bot.send_photo(
-            opponent_id,
-            photo.file_id,
-            caption="<b>[Фото от собеседника]</b>\nЭто котик? Подтверди, чтобы ему засчитался балл! 👇",
-            reply_markup=verify_kb,
-            parse_mode="HTML"
-        )
+        try:
+            await bot.send_photo(
+                opponent_id,
+                photo.file_id,
+                caption="<b>[Фото от собеседника]</b>\nЭто котик? Подтверди, чтобы ему засчитался балл! 👇",
+                reply_markup=verify_kb,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить фото оппоненту {opponent_id}: {e}")
+            # Удаляем запись о фото, если оно не доставлено — это соответствует политике «не храним лишнее»
+            await db_conn.execute("DELETE FROM cat_photos WHERE id = ?", (photo_record_id,))
+            await db_conn.commit()
+            await message.answer("❌ Не удалось доставить фото собеседнику. Попробуй ещё раз позже.")
         return
 
     if message.text:
@@ -1087,23 +1093,22 @@ async def handle_chat_and_media(message: Message):
             await message.answer("Не удалось доставить сообщение собеседнику.")
     else:
         await message.answer("В этом режиме поддерживаются только текстовые сообщения и фото котиков.")
-    return
-
 
 
 async def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    global db_conn
+    global db_conn, bot, dp
     db_conn = await aiosqlite.connect(db_path)
     await init_db()
-    
-
-
     await cleanup_old_photos()
 
-    dp.include_router(router)
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+
+    # Мидлварь вешаем ТОЛЬКО здесь, после создания dp и bot
     dp.update.middleware(BanCheckMiddleware())
+    dp.include_router(router)
 
     cleanup_task = asyncio.create_task(periodic_cleanup())
 
