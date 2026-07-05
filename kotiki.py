@@ -541,22 +541,27 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
     policy_version = "v1.2"
     now = datetime.now()
 
-    # Сначала проверяем, есть ли пользователь в базе
     async with db_conn.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
         row = await cursor.fetchone()
 
     if row is None:
-        # Если пользователя нет — делаем INSERT с минимально нужными полями
+        # INSERT: добавляем все обязательные поля + согласие
         await db_conn.execute(
             """
             INSERT INTO users (
-                user_id, username, consent_policy_version, consent_timestamp
-            ) VALUES (?, ?, ?, ?)
+                user_id, username, age_category, gender, target_gender, status,
+                consent_policy_version, consent_timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, callback.from_user.username or f"User_{user_id}", policy_version, now)
+            (
+                user_id,
+                callback.from_user.username or f"User_{user_id}",
+                None, None, None, 'idle',
+                policy_version, now
+            )
         )
     else:
-        # Если пользователь уже есть — делаем UPDATE только по полям согласия
+        # UPDATE: обновляем только согласие
         await db_conn.execute(
             """
             UPDATE users
@@ -579,7 +584,6 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(Registration.waiting_for_age)
     await callback.answer()
-
 
 # --- ПРОЦЕСС РЕГИСТРАЦИИ ---
 @router.message(Registration.waiting_for_age)
