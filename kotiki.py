@@ -83,11 +83,12 @@ async def init_db():
     
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS cat_photos (
-        file_unique_id TEXT PRIMARY KEY,
-        user_id INTEGER,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_unique_id TEXT NOT NULL,
+        file_id TEXT,
+        user_id INTEGER NOT NULL,
         uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
+    )''')
     
     
     await db_conn.execute('''
@@ -846,40 +847,37 @@ async def show_leaderboard(message: Message):
     
     await message.answer(text, parse_mode="HTML")
 
+
+
 async def cleanup_old_photos():
-    # Удаляем фото, загруженные более 180 дней назад
-    await db_conn.execute(
-        "DELETE FROM cat_photos WHERE uploaded_at < datetime('now', '-180 days')"
-    )
-    await db_conn.commit()
-    logging.info("Очистка старых фото (старше 180 дней) завершена.")
-
-
-async def periodic_cleanup():
-    while True:
-        try:
-            await cleanup_old_photos()
-        except Exception as e:
-            logging.error(f"Ошибка периодической очистки: {e}")
-        await asyncio.sleep(86400)
+    if db_conn is None:
+        logging.warning("База данных ещё не подключена, пропускаем очистку.")
+        return
+    try:
+        await db_conn.execute(
+            "DELETE FROM cat_photos WHERE uploaded_at < datetime('now', '-180 days')"
+        )
+        await db_conn.commit()
+        logging.info("Очистка старых фото (старше 180 дней) завершена.")
+    except Exception as e:
+        logging.error(f"Ошибка очистки старых фото: {e}")
 
 # --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
 @router.callback_query(F.data.startswith("check_cat:"))
 async def process_cat_check(callback: CallbackQuery):
     parts = callback.data.split(":")
-    # parts: ['check_cat', 'yes/no/report', user_id, file_unique_id]
     if len(parts) < 4:
         await callback.answer("Ошибка данных кнопки", show_alert=True)
         return
 
     action = parts[1]          # yes / no / report
     sender_id = int(parts[2])
-    file_unique_id = parts[3]
+    photo_record_id = int(parts[3])  # это внутренний id из таблицы cat_photos
 
-    # Достаём file_id из БД по file_unique_id
+    # Получаем данные фото по внутреннему ID
     async with db_conn.execute(
-        "SELECT file_id FROM cat_photos WHERE file_unique_id = ?",
-        (file_unique_id,)
+        "SELECT file_id, file_unique_id, user_id FROM cat_photos WHERE id = ?",
+        (photo_record_id,)
     ) as cursor:
         row = await cursor.fetchone()
 
@@ -887,44 +885,55 @@ async def process_cat_check(callback: CallbackQuery):
         await callback.answer("Фото не найдено в базе", show_alert=True)
         return
 
-    file_id = row[0]
+    file_id, file_unique_id, stored_user_id = row
 
-    # Дальше логика по action:
+    # Проверка: только владелец фото может подтверждать/жаловаться
+    if stored_user_id != sender_id:
+        await callback.answer("Это не твоё фото!", show_alert=True)
+        return
+
     if action == "report":
-        # Отправляем фото админу с пометкой о жалобе
-        await bot.send_photo(
-            chat_id=MODERATION_CHAT_ID,
-            photo=file_id,
-            caption=(
-                f"🚨 Жалоба на фото!\n"
-                f"От пользователя: {sender_id}\n"
-                f"file_unique_id: {file_unique_id}"
-            )
-        )
-        await callback.answer("Жалоба отправлена модераторам.")
-        # Тут можно сохранить запись о жалобе в отдельную таблицу reports
+        if MODERATION_CHAT_ID and file_id:
+            try:
+                await bot.send_photo(
+                    MODERATION_CHAT_ID,
+                    file_id,
+                    caption=(f"🚨 <b>ЖАЛОБА НА ФОТО</b>\n"
+                             f"Нарушитель: <code>{stored_user_id}</code>\n"
+                             f"Жалуется: <code>{callback.from_user.id}</code>"),
+                    reply_markup=get_moderation_kb(stored_user_id),
+                    parse_mode="HTML"
+                )
+                await callback.message.answer("🚨 Жалоба успешно отправлена администратору.")
+            except Exception as e:
+                logging.error(f"Ошибка отправки жалобы: {e}")
+                await callback.answer("Не удалось отправить жалобу.", show_alert=True)
+        else:
+            await callback.answer("Нет чата модерации.", show_alert=True)
+
     elif action == "yes":
-        # Проверка на повторное использование
-        async with db_conn.execute("SELECT user_id FROM cat_photos WHERE file_unique_id = ?", (file_unique_id,)) as cursor:
+        # Проверка: не было ли это фото уже засчитано кому-то другому
+        async with db_conn.execute(
+            "SELECT id FROM cat_photos WHERE file_unique_id = ? AND user_id != ?",
+            (file_unique_id, sender_id)
+        ) as cursor:
             if await cursor.fetchone():
-                await bot.send_message(sender_id, "❌ Это фото кота уже использовалось в игре! Балл не засчитан.")
-                await callback.message.answer("Это фото уже было засчитано ранее.")
+                await callback.answer("❌ Это фото уже использовалось другим игроком!", show_alert=True)
                 return
-            
-        await db_conn.execute(
-            "INSERT OR IGNORE INTO cat_photos (file_unique_id, user_id, uploaded_at) VALUES (?, ?, ?)",
-            (file_unique_id, sender_id, datetime.now())
-        )
-        await db_conn.commit()
 
         # Начисление баллов
         await db_conn.execute(
-            "UPDATE users SET current_match_cats = current_match_cats + 1, total_cats = total_cats + 1 WHERE user_id = ?",
+            """
+            UPDATE users
+            SET current_match_cats = current_match_cats + 1,
+                total_cats = total_cats + 1
+            WHERE user_id = ?
+            """,
             (sender_id,)
         )
         await db_conn.commit()
 
-        # Получение обновленных баллов
+        # Получение обновлённых баллов
         async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,)) as cursor:
             row = await cursor.fetchone()
             sender_score = row[0] if row else 0
@@ -933,35 +942,17 @@ async def process_cat_check(callback: CallbackQuery):
             row = await cursor.fetchone()
             my_score = row[0] if row else 0
 
-        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил котика! Твой счет: {sender_score}")
-        await callback.message.answer(f"✅ Засчитано! У собеседника теперь {sender_score} 🐈\nТвой счет: {my_score}")
+        await bot.send_message(sender_id, f"🎉 Собеседник подтвердил котика! Твой счёт: {sender_score}")
+        await callback.message.answer(f"✅ Засчитано! У собеседника теперь {sender_score} 🐈\nТвой счёт: {my_score}")
 
     elif action == "no":
-        await bot.send_message(sender_id, "📸 Собеседник отметил твое фото как обычный снимок.")
+        await bot.send_message(sender_id, "📸 Собеседник отметил твоё фото как обычный снимок.")
         await callback.message.answer("Принято!")
 
-    elif action == "report":
-        await bot.send_message(sender_id, "⚠️ На ваше фото поступила жалоба. Ожидайте решения модератора.")
-        await callback.message.answer("🚨 Жалоба успешно отправлена администратору.")
-
-        if MODERATION_CHAT_ID and file_id:
-            try:
-                await bot.send_photo(
-                    MODERATION_CHAT_ID,
-                    file_id,
-                    caption=(f"🚨 <b>ЖАЛОБА НА ФОТО</b>\nНарушитель: <code>{sender_id}</code>\n"
-                             f"Жалуется: <code>{callback.from_user.id}</code>"),
-                    reply_markup=get_moderation_kb(sender_id),
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logging.error(f"Ошибка отправки жалобы: {e}")
-
-    # 3. Финализируем
     await callback.answer()
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except:
+    except Exception:
         pass
 
     
@@ -999,27 +990,35 @@ async def handle_chat_and_media(message: Message):
     # Обработка фото
     if message.photo:
         photo = message.photo[-1]
+        file_id = photo.file_id
         file_unique_id = photo.file_unique_id
-
-        file_id = photo.file_id 
-
+    
+        cursor = await db_conn.execute(
+            """
+            INSERT INTO cat_photos (file_unique_id, file_id, user_id, uploaded_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (file_unique_id, file_id, user_id, datetime.now())
+        )
+        photo_record_id = cursor.lastrowid
+        await db_conn.commit()
+    
         verify_kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="🐱 Да, это кот!", callback_data=f"check_cat:yes:{user_id}:{file_unique_id}"),
-                InlineKeyboardButton(text="📸 Просто фото", callback_data=f"check_cat:no:{user_id}:{file_unique_id}")
+                InlineKeyboardButton(text="🐱 Да, это кот!", callback_data=f"check_cat:yes:{user_id}:{photo_record_id}"),
+                InlineKeyboardButton(text="📸 Просто фото", callback_data=f"check_cat:no:{user_id}:{photo_record_id}")
             ],
             [
-                # Сюда добавляем :file_id в конец строки
-                InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{file_unique_id}")
+                InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{photo_record_id}")
             ]
         ])
-
+    
         await message.answer("⏳ Отправил фото собеседнику на подтверждение...")
-        
+    
         await bot.send_photo(
-            opponent_id, 
-            photo.file_id, 
-            caption="<b>[Фото от собеседника]</b>\nЭто котик? Подтверди, чтобы ему засчитался балл! 👇", 
+            opponent_id,
+            photo.file_id,
+            caption="<b>[Фото от собеседника]</b>\nЭто котик? Подтверди, чтобы ему засчитался балл! 👇",
             reply_markup=verify_kb,
             parse_mode="HTML"
         )
@@ -1036,25 +1035,26 @@ async def handle_chat_and_media(message: Message):
             await message.answer("Не удалось доставить сообщение собеседнику.")
 
 
+
 async def main():
-    # 1. Сначала логирование
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    # 2. Инициализация БД
-    await init_db()
+
+    global db_conn
+    db_conn = await aiosqlite.connect(db_path)
+    await init_db()  # только CREATE TABLE IF NOT EXISTS, без повторных подключений
+
     await cleanup_old_photos()
-    
-    # 3. Регистрация всего (роутеры, мидлвары)
+
     dp.include_router(router)
     dp.update.middleware(BanCheckMiddleware())
+
     cleanup_task = asyncio.create_task(periodic_cleanup())
-    # 4. Запуск (delete_webhook нужен, чтобы сбросить старые зависшие запросы)
+
     logging.info("Бот запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
     try:
         await dp.start_polling(bot)
     finally:
-        # Корректно останавливаем фоновую задачу при выключении бота
         cleanup_task.cancel()
         try:
             await cleanup_task
