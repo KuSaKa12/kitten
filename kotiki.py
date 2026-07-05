@@ -102,7 +102,7 @@ async def init_db():
     await db_conn.commit()
 
 
-dp.update.middleware(BanCheckMiddleware())
+
 
 # Настройки для Windows
 if sys.platform == 'win32':
