@@ -298,6 +298,22 @@ async def check_subscription(user_id: int) -> bool:
         return True 
 
 
+def test_crypto():
+    original = "test-user-12345"
+    print("TEST: Исходная строка:", original)
+
+    ciphertext = encrypt_data(original)
+    print("TEST: Зашифрованные данные (hex):", ciphertext.hex())
+    print("TEST: Длина зашифрованных данных (байты):", len(ciphertext))
+
+    decrypted = decrypt_data(ciphertext)
+    print("TEST: Расшифрованная строка:", decrypted)
+
+    assert original == decrypted, "ОШИБКА: строки не совпали!"
+    print("TEST: Шифрование и расшифровка работают корректно!")
+
+# Вызови один раз при старте (для проверки)
+test_crypto()
 # --- АДМИН ПАНЕЛЬ: БАН (Ручная команда) ---
 @router.message(Command("ban"))
 async def cmd_ban(message: Message, command: CommandObject):
