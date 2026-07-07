@@ -1,28 +1,83 @@
+import os
+import sys
+import stat
+import asyncio
+import logging
+import socket
+from datetime import datetime, timedelta
+
 import html
 import aiosqlite
-import socket
-import sys
-import asyncio
-import os
-import logging
-import sqlite3
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
+
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, \
-    InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram import BaseMiddleware
 
 
+load_dotenv()
 
+# --- ШИФРОВАНИЕ (сразу после импортов) ---
+
+def get_encryption_key() -> bytes:
+    env_key = os.getenv('ENCRYPTION_KEY')
+    if not env_key:
+        raise ValueError("ENCRYPTION_KEY не задан в переменных окружения!")
+
+    # Вариант 1: HEX строка из 64 символов = 32 байта
+    if len(env_key) == 64:
+        try:
+            return bytes.fromhex(env_key)
+        except ValueError:
+            raise ValueError("ENCRYPTION_KEY должен быть валидной HEX-строкой из 64 символов.")
+
+    # Вариант 2: если ты хочешь просто строку, бери первые 32 байта UTF-8
+    key_bytes = env_key.encode('utf-8')
+    if len(key_bytes) < 32:
+        raise ValueError("ENCRYPTION_KEY слишком короткий (минимум 32 байта).")
+    return key_bytes[:32]
+
+_KEY = None
+
+def get_cached_key() -> bytes:
+    global _KEY
+    if _KEY is None:
+        _KEY = get_encryption_key()
+    return _KEY
+
+def encrypt_data(plaintext: str) -> bytes:
+    key = get_cached_key()
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(plaintext.encode('utf-8')) + padder.finalize()
+    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+    return iv + ciphertext
+
+def decrypt_data(ciphertext: bytes) -> str:
+    if len(ciphertext) < 16:
+        raise ValueError("Некорректные зашифрованные данные")
+    key = get_cached_key()
+    iv = ciphertext[:16]
+    actual_ciphertext = ciphertext[16:]
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    decrypted_padded = decryptor.update(actual_ciphertext) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    plaintext = unpadder.update(decrypted_padded) + unpadder.finalize()
+    return plaintext.decode('utf-8')
 
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if db_conn is None:
-            # Если БД ещё не подключена — не блокируем, а логируем и пропускаем
             logging.warning("Middleware: БД ещё не инициализирована, пропускаем проверку бана.")
             return await handler(event, data)
 
@@ -51,24 +106,44 @@ class BanCheckMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (только ссылки, без инициализации) ---
+
+db_conn = None
+bot = None  # будет присвоен через dp.bot
+dp = None
+
 CHANNEL_ID = "@ITkaktusik"
 db_path = "/app/data/cat_game.db"
 os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-# Глобальная переменная для базы
-db_conn = None
+if os.path.exists(db_path):
+    os.chmod(db_path, stat.S_IRUSR | stat.S_IWUSR)
+
+# --- БАЗА ДАННЫХ ---
 
 async def init_db():
+    # 1. Создаём директорию, если её нет
+    db_dir = os.path.dirname(db_path)
+    os.makedirs(db_dir, exist_ok=True)
+
+    # 2. Если файл уже есть — ставим права 600
+    if os.path.exists(db_path):
+        os.chmod(db_path, stat.S_IRUSR | stat.S_IWUSR)  # это и есть 600: rw-------
+
+    # 3. Подключаемся к БД (теперь она будет под правильными правами)
+    global db_conn
+    db_conn = await aiosqlite.connect(db_path)
+
+    # Дальше твои CREATE TABLE...
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS banned_users (
         user_id INTEGER PRIMARY KEY
     )''')
     
-    # ТОЛЬКО изначальные колонки (без consent_policy_version и consent_timestamp)
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        username TEXT,
+        username BLOB,              -- если шифруешь username, используй BLOB
         age_category TEXT,
         gender TEXT,
         target_gender TEXT,
@@ -80,7 +155,6 @@ async def init_db():
         consent_timestamp DATETIME
     )''')
 
-    
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS cat_photos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,22 +175,32 @@ async def init_db():
     
     await db_conn.commit()
 
+async def cleanup_old_photos():
+    if db_conn is None:
+        logging.warning("База данных ещё не подключена, пропускаем очистку.")
+        return
+    try:
+        await db_conn.execute(
+            "DELETE FROM cat_photos WHERE uploaded_at < datetime('now', '-180 days')"
+        )
+        await db_conn.commit()
+        logging.info("Очистка старых фото (старше 180 дней) завершена.")
+    except Exception as e:
+        logging.error(f"Ошибка очистки старых фото: {e}")
 
+async def periodic_cleanup():
+    while True:
+        try:
+            await asyncio.sleep(86400)  # раз в сутки
+            if db_conn is not None:
+                await cleanup_old_photos()
+        except asyncio.CancelledError:
+            logging.info("Задача периодической очистки остановлена.")
+            break
+        except Exception as e:
+            logging.error(f"Критическая ошибка в цикле очистки: {e}")
+            await asyncio.sleep(3600)
 
-
-# Настройки для Windows
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    old_getaddrinfo = socket.getaddrinfo
-
-    def new_getaddrinfo(*args, **kwargs):
-        responses = old_getaddrinfo(*args, **kwargs)
-        return [r for r in responses if r[0] == socket.AF_INET]
-
-    socket.getaddrinfo = new_getaddrinfo
-
-
-load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов (баги/предложения)
 # ID чата модерации (группы), куда будут приходить жалобы на игроков. 
@@ -892,32 +976,7 @@ async def show_leaderboard(message: Message):
 
 
 
-async def cleanup_old_photos():
-    if db_conn is None:
-        logging.warning("База данных ещё не подключена, пропускаем очистку.")
-        return
 
-    try:
-        await db_conn.execute(
-            "DELETE FROM cat_photos WHERE uploaded_at < datetime('now', '-180 days')"
-        )
-        await db_conn.commit()
-        logging.info("Очистка старых фото (старше 180 дней) завершена.")
-    except Exception as e:
-        logging.error(f"Ошибка очистки старых фото: {e}")
-
-async def periodic_cleanup():
-    while True:
-        try:
-            await asyncio.sleep(86400)
-            if db_conn is not None:
-                await cleanup_old_photos()
-        except asyncio.CancelledError:
-            logging.info("Задача периодической очистки остановлена.")
-            break
-        except Exception as e:
-            logging.error(f"Критическая ошибка в цикле очистки: {e}")
-            await asyncio.sleep(3600)
 # --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
 @router.callback_query(F.data.startswith("check_cat:"))
 async def process_cat_check(callback: CallbackQuery):
