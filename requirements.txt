@@ -1,3 +1,4 @@
 aiogram
 python-dotenv
 aiosqlite
+cryptography>=41.0.0
