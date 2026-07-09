@@ -23,31 +23,7 @@ from aiogram import BaseMiddleware
 
 load_dotenv()
 
-# =========================================================================
-# ШИФРОВАНИЕ: AES-256-GCM (аутентифицированное шифрование, AEAD)
-# =========================================================================
-# Было: AES-CBC + PKCS7 без какой-либо проверки целостности (без HMAC/тега).
-#   Проблемы:
-#   1) Уязвимость к padding-oracle атакам (можно подобрать plaintext по
-#      ответам сервера на "правильность" паддинга).
-#   2) Уязвимость к bit-flipping — шифротекст можно модифицировать по
-#      известным смещениям, и получатель расшифрует его без единого сигнала,
-#      что данные были подделаны.
-#   3) Что важнее всего: функции encrypt_data/decrypt_data вообще нигде не
-#      вызывались. Юзернейм (username) писался в БД как есть, открытым
-#      текстом, несмотря на комментарий "если шифруешь username, используй
-#      BLOB" — колонка BLOB была, а шифрования не было. Переписка
-#      (chat_history.text) тоже хранилась в открытом виде.
-# Стало: AES-256-GCM — шифрование и проверка подлинности в одной операции,
-#   паддинг не нужен (сам класс padding-oracle атак исключён), подмена
-#   шифротекста обнаруживается при расшифровке (InvalidTag).
-#   Формат хранимого BLOB: nonce(12 байт) || ciphertext_with_tag(16 байт тег).
-#   Шифруются: username и текст переписки (chat_history.text) — то есть все
-#   поля, которые не участвуют в точном SQL-поиске по значению. Значения,
-#   которые действительно ищутся по точному совпадению (file_unique_id),
-#   намеренно не шифруются — детерминированное шифрование для них отдельная
-#   задача и не даёт того же уровня защиты, а нынешняя логика дублей на нём
-#   завязана.
+
 
 _NONCE_LEN = 12  # рекомендованная длина nonce для GCM
 _TAG_LEN = 16
@@ -920,6 +896,34 @@ async def find_player(message: Message, state: FSMContext):
         await db_conn.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
         await db_conn.commit()
         await message.answer("🔍 Ищем собеседника... Пожалуйста, подожди.", reply_markup=get_search_menu())
+
+
+# --- ОСТАНОВКА ПОИСКА ---
+# У этой кнопки никогда не было обработчика — ни в исходном коде, ни в
+# предыдущей версии. Нажатие проваливалось в общий catch-all
+# (handle_chat_and_media), который подменял клавиатуру на главное меню, но
+# статус пользователя в БД оставался 'searching'. Отсюда и эффект «кнопка
+# пропала»: клавиатура визуально менялась, а поиск по факту не
+# останавливался.
+@router.message(F.text == "🛑 Остановить поиск")
+async def stop_search(message: Message):
+    user_id = message.from_user.id
+
+    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
+
+    if not res or res[0] != 'searching':
+        await message.answer("Ты сейчас не в поиске.", reply_markup=get_main_menu())
+        return
+
+    await db_conn.execute(
+        "UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?",
+        (user_id,)
+    )
+    await db_conn.commit()
+    await message.answer("🛑 Поиск остановлен.", reply_markup=get_main_menu())
+
+
 # --- ЗАПРОС НА ЗАВЕРШЕНИЕ ИГРЫ ---
 @router.message(F.text == "🏁 Завершить игру")
 async def ask_end_game(message: Message):
