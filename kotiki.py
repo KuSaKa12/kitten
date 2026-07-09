@@ -741,7 +741,7 @@ async def change_profile(message: Message, state: FSMContext):
 @router.callback_query(Registration.waiting_for_rules, F.data == "start_registration")
 async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
-    policy_version = "v1.2"
+    policy_version = "v2.0"
     now = datetime.now()
 
     async with db_conn.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
