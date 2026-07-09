@@ -1,18 +1,17 @@
 import os
-import sys
 import stat
 import asyncio
 import logging
-import socket
 from datetime import datetime, timedelta
+from typing import Optional
 
 import html
 import aiosqlite
 from dotenv import load_dotenv
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -24,27 +23,65 @@ from aiogram import BaseMiddleware
 
 load_dotenv()
 
-# --- ШИФРОВАНИЕ (сразу после импортов) ---
+# =========================================================================
+# ШИФРОВАНИЕ: AES-256-GCM (аутентифицированное шифрование, AEAD)
+# =========================================================================
+# Было: AES-CBC + PKCS7 без какой-либо проверки целостности (без HMAC/тега).
+#   Проблемы:
+#   1) Уязвимость к padding-oracle атакам (можно подобрать plaintext по
+#      ответам сервера на "правильность" паддинга).
+#   2) Уязвимость к bit-flipping — шифротекст можно модифицировать по
+#      известным смещениям, и получатель расшифрует его без единого сигнала,
+#      что данные были подделаны.
+#   3) Что важнее всего: функции encrypt_data/decrypt_data вообще нигде не
+#      вызывались. Юзернейм (username) писался в БД как есть, открытым
+#      текстом, несмотря на комментарий "если шифруешь username, используй
+#      BLOB" — колонка BLOB была, а шифрования не было. Переписка
+#      (chat_history.text) тоже хранилась в открытом виде.
+# Стало: AES-256-GCM — шифрование и проверка подлинности в одной операции,
+#   паддинг не нужен (сам класс padding-oracle атак исключён), подмена
+#   шифротекста обнаруживается при расшифровке (InvalidTag).
+#   Формат хранимого BLOB: nonce(12 байт) || ciphertext_with_tag(16 байт тег).
+#   Шифруются: username и текст переписки (chat_history.text) — то есть все
+#   поля, которые не участвуют в точном SQL-поиске по значению. Значения,
+#   которые действительно ищутся по точному совпадению (file_unique_id),
+#   намеренно не шифруются — детерминированное шифрование для них отдельная
+#   задача и не даёт того же уровня защиты, а нынешняя логика дублей на нём
+#   завязана.
+
+_NONCE_LEN = 12  # рекомендованная длина nonce для GCM
+_TAG_LEN = 16
+
 
 def get_encryption_key() -> bytes:
     env_key = os.getenv('ENCRYPTION_KEY')
     if not env_key:
         raise ValueError("ENCRYPTION_KEY не задан в переменных окружения!")
 
-    # Вариант 1: HEX строка из 64 символов = 32 байта
+    # Предпочтительный вариант: 64-символьная HEX-строка = 32 случайных байта.
+    # Сгенерировать: python -c "import secrets; print(secrets.token_hex(32))"
     if len(env_key) == 64:
         try:
-            return bytes.fromhex(env_key)
+            key = bytes.fromhex(env_key)
+            if len(key) == 32:
+                return key
         except ValueError:
-            raise ValueError("ENCRYPTION_KEY должен быть валидной HEX-строкой из 64 символов.")
+            pass  # не HEX — уходим в KDF-путь ниже
 
-    # Вариант 2: если ты хочешь просто строку, бери первые 32 байта UTF-8
-    key_bytes = env_key.encode('utf-8')
-    if len(key_bytes) < 32:
-        raise ValueError("ENCRYPTION_KEY слишком короткий (минимум 32 байта).")
-    return key_bytes[:32]
+    # Фолбэк для "человекочитаемого" секрета.
+    # Раньше ключ получался обрезанием строки до первых 32 байт UTF-8 — это
+    # даёт ключ с низкой и предсказуемой энтропией, если исходная строка не
+    # случайна (обычный пароль/фраза). Пропускаем секрет через HKDF, чтобы
+    # получить полноценный равномерно распределённый 256-битный ключ.
+    if len(env_key.encode('utf-8')) < 16:
+        raise ValueError("ENCRYPTION_KEY слишком короткий (минимум 16 байт для режима с KDF).")
+    salt = os.getenv('ENCRYPTION_KEY_SALT', 'kotoLOVe-v2-static-salt').encode('utf-8')
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'kotoLOVe-aes-gcm-key')
+    return hkdf.derive(env_key.encode('utf-8'))
 
-_KEY = None
+
+_KEY: Optional[bytes] = None
+
 
 def get_cached_key() -> bytes:
     global _KEY
@@ -52,49 +89,57 @@ def get_cached_key() -> bytes:
         _KEY = get_encryption_key()
     return _KEY
 
-def encrypt_data(plaintext: str) -> bytes:
-    key = get_cached_key()
-    iv = os.urandom(16)
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(plaintext.encode('utf-8')) + padder.finalize()
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-    return iv + ciphertext
 
-def decrypt_data(ciphertext: bytes) -> str:
-    if len(ciphertext) < 16:
+def encrypt_data(plaintext: Optional[str]) -> Optional[bytes]:
+    """Шифрует строку для хранения в БД (BLOB). None остаётся None."""
+    if plaintext is None:
+        return None
+    key = get_cached_key()
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(_NONCE_LEN)
+    ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
+    return nonce + ciphertext
+
+
+def decrypt_data(blob: Optional[bytes]) -> Optional[str]:
+    """Обратная операция к encrypt_data. None остаётся None."""
+    if blob is None:
+        return None
+    if len(blob) < _NONCE_LEN + _TAG_LEN:
         raise ValueError("Некорректные зашифрованные данные")
     key = get_cached_key()
-    iv = ciphertext[:16]
-    actual_ciphertext = ciphertext[16:]
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    decrypted_padded = decryptor.update(actual_ciphertext) + decryptor.finalize()
-    unpadder = padding.PKCS7(128).unpadder()
-    plaintext = unpadder.update(decrypted_padded) + unpadder.finalize()
+    aesgcm = AESGCM(key)
+    nonce, ciphertext = blob[:_NONCE_LEN], blob[_NONCE_LEN:]
+    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
     return plaintext.decode('utf-8')
 
-class BanCheckMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        if db_conn is None:
-            logging.warning("Middleware: БД ещё не инициализирована, пропускаем проверку бана.")
-            return await handler(event, data)
 
+def _crypto_selftest():
+    """Самопроверка шифрования. Запускается только при DEBUG=1 и ничего
+    чувствительного в лог/консоль не пишет (только факт успеха/неудачи).
+    Раньше это была test_crypto(), которая печатала в stdout при каждом
+    импорте модуля — то есть при каждом запуске бота, включая прод."""
+    original = "self-test-string"
+    blob = encrypt_data(original)
+    assert decrypt_data(blob) == original, "Расшифрованная строка не совпала с исходной"
+    logging.debug("Самопроверка шифрования пройдена успешно.")
+
+
+class BanCheckMiddleware(BaseMiddleware):
+    """Проверка бана по кэшу в памяти (banned_users_cache), а не запросом к
+    БД на каждое апдейт-событие. При большом трафике это самый "горячий"
+    путь в боте — раньше на каждое сообщение/callback уходил отдельный
+    SELECT в SQLite."""
+
+    async def __call__(self, handler, event, data):
         user = event.from_user if hasattr(event, "from_user") else None
         if user is None:
             return await handler(event, data)
 
-        async with db_conn.execute(
-            "SELECT user_id FROM banned_users WHERE user_id = ?",
-            (user.id,)
-        ) as cursor:
-            is_banned = await cursor.fetchone()
-
-        if is_banned:
-            if isinstance(event, Message) and event.text == "/delete_data":
+        if user.id in banned_users_cache:
+            if isinstance(event, Message) and event.text and event.text.startswith("/delete_data"):
                 return await handler(event, data)
-            if isinstance(event, CallbackQuery) and event.data.startswith("delete_confirm_"):
+            if isinstance(event, CallbackQuery) and event.data and event.data.startswith("delete_confirm_"):
                 return await handler(event, data)
 
             if isinstance(event, Message):
@@ -111,6 +156,7 @@ class BanCheckMiddleware(BaseMiddleware):
 db_conn = None
 bot = None  # будет присвоен через dp.bot
 dp = None
+banned_users_cache: set = set()
 
 CHANNEL_ID = "@ITkaktusik"
 db_path = "/app/data/cat_game.db"
@@ -121,35 +167,50 @@ if os.path.exists(db_path):
 
 # --- БАЗА ДАННЫХ ---
 
+async def refresh_banned_cache():
+    global banned_users_cache
+    if db_conn is None:
+        return
+    async with db_conn.execute("SELECT user_id FROM banned_users") as cursor:
+        rows = await cursor.fetchall()
+    banned_users_cache = {row[0] for row in rows}
+
+
 async def init_db():
-    # 1. Создаём директорию, если её нет
+    global db_conn
+
     db_dir = os.path.dirname(db_path)
     os.makedirs(db_dir, exist_ok=True)
 
-    # 2. Если файл уже есть — ставим права 600
     if os.path.exists(db_path):
-        os.chmod(db_path, stat.S_IRUSR | stat.S_IWUSR)  # это и есть 600: rw-------
+        os.chmod(db_path, stat.S_IRUSR | stat.S_IWUSR)  # 600: rw-------
 
-    # 3. Подключаемся к БД (теперь она будет под правильными правами)
-    global db_conn
-    db_conn = await aiosqlite.connect(db_path)
+    # ИСПРАВЛЕНО: раньше main() создавал соединение (aiosqlite.connect), а
+    # затем init_db() создавало ВТОРОЕ соединение и перезаписывало
+    # глобальную переменную db_conn — первое соединение никогда не
+    # закрывалось (утечка файлового дескриптора). Теперь соединение
+    # создаётся один раз и только здесь.
+    if db_conn is None:
+        db_conn = await aiosqlite.connect(db_path)
 
-    # Дальше твои CREATE TABLE...
+    await db_conn.execute("PRAGMA journal_mode=WAL;")
+    await db_conn.execute("PRAGMA foreign_keys=ON;")
+
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS banned_users (
         user_id INTEGER PRIMARY KEY
     )''')
-    
+
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        username BLOB,              -- если шифруешь username, используй BLOB
+        username BLOB,              -- зашифровано (AES-GCM)
         age_category TEXT,
         gender TEXT,
         target_gender TEXT,
-        status TEXT DEFAULT 'idle', 
-        current_match_cats INTEGER DEFAULT 0, 
-        total_cats INTEGER DEFAULT 0,         
+        status TEXT DEFAULT 'idle',
+        current_match_cats INTEGER DEFAULT 0,
+        total_cats INTEGER DEFAULT 0,
         current_opponent INTEGER DEFAULT NULL,
         consent_policy_version TEXT,
         consent_timestamp DATETIME
@@ -163,19 +224,39 @@ async def init_db():
         user_id INTEGER NOT NULL,
         uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
-    
+
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS chat_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender_id INTEGER,
         receiver_id INTEGER,
-        text TEXT,
+        text BLOB,                  -- зашифровано (AES-GCM)
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
-    
-    await db_conn.commit()
 
-async def cleanup_old_photos():
+    # Индексы под реальные запросы бота (раньше отсутствовали):
+    #  - поиск собеседника фильтрует по status/age_category/gender/target_gender
+    #  - проверка дубля фото ищет по file_unique_id
+    #  - очистка и жалобы фильтруют по времени и паре собеседников
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_users_search ON users(status, age_category, gender, target_gender)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_photos_unique ON cat_photos(file_unique_id)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_photos_uploaded_at ON cat_photos(uploaded_at)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_pair ON chat_history(sender_id, receiver_id, timestamp)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_timestamp ON chat_history(timestamp)")
+
+    await db_conn.commit()
+    await refresh_banned_cache()
+
+
+async def cleanup_old_data():
+    """Раньше чистились только старые фото (>180 дней). По 152-ФЗ (ст. 5 —
+    принцип минимизации: данные хранятся не дольше, чем нужно для цели
+    обработки) переписку тоже нельзя хранить бессрочно. Штатно она и так
+    удаляется при завершении игры/бане/удалении аккаунта/повторном /start,
+    но если диалог просто "подвис" (собеседник исчез, не нажав ни одну из
+    этих кнопок), сообщения могли оставаться в БД неограниченно долго.
+    Функция жалобы (report_player_chat) смотрит только на последние 20 минут,
+    поэтому хранить историю дольше нескольких дней не требуется."""
     if db_conn is None:
         logging.warning("База данных ещё не подключена, пропускаем очистку.")
         return
@@ -183,17 +264,21 @@ async def cleanup_old_photos():
         await db_conn.execute(
             "DELETE FROM cat_photos WHERE uploaded_at < datetime('now', '-180 days')"
         )
+        await db_conn.execute(
+            "DELETE FROM chat_history WHERE timestamp < datetime('now', '-3 days')"
+        )
         await db_conn.commit()
-        logging.info("Очистка старых фото (старше 180 дней) завершена.")
+        logging.info("Очистка старых фото (>180 дней) и переписки (>3 дней) завершена.")
     except Exception as e:
-        logging.error(f"Ошибка очистки старых фото: {e}")
+        logging.error(f"Ошибка очистки старых данных: {e}")
+
 
 async def periodic_cleanup():
     while True:
         try:
             await asyncio.sleep(86400)  # раз в сутки
             if db_conn is not None:
-                await cleanup_old_photos()
+                await cleanup_old_data()
         except asyncio.CancelledError:
             logging.info("Задача периодической очистки остановлена.")
             break
@@ -202,10 +287,10 @@ async def periodic_cleanup():
             await asyncio.sleep(3600)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID") # Для системы репортов (баги/предложения)
-# ID чата модерации (группы), куда будут приходить жалобы на игроков. 
+ADMIN_ID = os.getenv("ADMIN_ID")  # Для системы репортов (баги/предложения)
+# ID чата модерации (группы), куда будут приходить жалобы на игроков.
 # Если не указан, упадет в личку ADMIN_ID
-MODERATION_CHAT_ID = os.getenv("MODERATION_CHAT_ID", ADMIN_ID) 
+MODERATION_CHAT_ID = os.getenv("MODERATION_CHAT_ID", ADMIN_ID)
 
 
 router = Router()
@@ -294,26 +379,14 @@ async def check_subscription(user_id: int) -> bool:
             return True
         return False
     except Exception as e:
+        # Осознанно fail-open: при сбое Telegram API (не связанном с самой
+        # подпиской) пользователя не блокируем. Если для вашей модели угроз
+        # это неприемлемо (например, обязательность подписки — бизнес-
+        # требование), стоит переключить на fail-closed и добавить повтор.
         logging.error(f"Ошибка проверки подписки: {e}")
         return True 
 
 
-def test_crypto():
-    original = "test-user-12345"
-    print("TEST: Исходная строка:", original)
-
-    ciphertext = encrypt_data(original)
-    print("TEST: Зашифрованные данные (hex):", ciphertext.hex())
-    print("TEST: Длина зашифрованных данных (байты):", len(ciphertext))
-
-    decrypted = decrypt_data(ciphertext)
-    print("TEST: Расшифрованная строка:", decrypted)
-
-    assert original == decrypted, "ОШИБКА: строки не совпали!"
-    print("TEST: Шифрование и расшифровка работают корректно!")
-
-# Вызови один раз при старте (для проверки)
-test_crypto()
 # --- АДМИН ПАНЕЛЬ: БАН (Ручная команда) ---
 @router.message(Command("ban"))
 async def cmd_ban(message: Message, command: CommandObject):
@@ -367,7 +440,8 @@ async def perform_ban(target_id: int):
     # 2. Сам бан: в таблицу banned_users и обновление статуса
     await db_conn.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (target_id,))
     await db_conn.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
-    await db_conn.commit() 
+    await db_conn.commit()
+    banned_users_cache.add(target_id)
 
     # Уведомление нарушителю
     try:
@@ -457,8 +531,8 @@ async def mod_ban_handler(callback: CallbackQuery):
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply(f"🔨 <b>Решение принято:</b> Пользователь <code>{target_id}</code> ЗАБАНЕН.", parse_mode="HTML")
-    except:
-        pass
+    except Exception as e:
+        logging.warning(f"Не удалось обновить сообщение модерации после бана {target_id}: {e}")
     await callback.answer("Пользователь заблокирован.")
 
 @router.callback_query(F.data.startswith("mod_dismiss:"))
@@ -467,8 +541,8 @@ async def mod_dismiss_handler(callback: CallbackQuery):
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply(f"❌ <b>Решение принято:</b> Жалоба на пользователя <code>{target_id}</code> ОТКЛОНЕНА.", parse_mode="HTML")
-    except:
-        pass
+    except Exception as e:
+        logging.warning(f"Не удалось обновить сообщение модерации после отклонения жалобы на {target_id}: {e}")
     await callback.answer("Жалоба отклонена.")
 
 
@@ -497,6 +571,7 @@ async def cmd_unban(message: Message, command: CommandObject):
         # Обновляем статус в таблице юзеров (если он не удалил аккаунт)
         await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ? AND status = 'banned'", (target_id,))
         await db_conn.commit()
+        banned_users_cache.discard(target_id)
         
         await message.answer(f"✅ Пользователь <code>{target_id}</code> успешно разбанен!", parse_mode="HTML")
     except ValueError:
@@ -506,7 +581,9 @@ async def cmd_unban(message: Message, command: CommandObject):
 @router.message(Command("report"))
 async def cmd_report(message: Message, state: FSMContext):
     async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
-        res = cursor.fetchone()
+        res = await cursor.fetchone()  # ИСПРАВЛЕНО: раньше не было await —
+        # res был объектом-корутиной, а не строкой из БД, и res[0] упал бы
+        # с TypeError при каждом вызове /report.
     if res and res[0] == 'banned':
         return
 
@@ -521,8 +598,16 @@ async def process_report(message: Message, state: FSMContext):
         res = await cursor.fetchone()
     opp_id_text = f"Последний собеседник ID: <code>{res[0]}</code>" if res and res[0] else "Собеседника нет"
 
-    user_info = f"От: @{message.from_user.username or 'без_юзернейма'} (ID: <code>{user_id}</code>)\n{opp_id_text}"
-    report_text = message.text or message.caption or "<i>Без текста</i>"
+    # ИСПРАВЛЕНО: раньше username и текст репорта подставлялись в
+    # HTML-сообщение админу БЕЗ экранирования (parse_mode="HTML"). Любой
+    # пользователь мог вставить в юзернейм/текст произвольные HTML-теги —
+    # от поломки форматирования и битых ссылок в чате админа/модерации до
+    # отказа отправки сообщения из-за невалидного HTML.
+    safe_username = html.escape(message.from_user.username or 'без_юзернейма')
+    user_info = f"От: @{safe_username} (ID: <code>{user_id}</code>)\n{opp_id_text}"
+
+    raw_text = message.text or message.caption
+    report_text = html.escape(raw_text) if raw_text else "<i>Без текста</i>"
     
     if ADMIN_ID:
         try:
@@ -631,9 +716,8 @@ async def change_profile(message: Message, state: FSMContext):
         return
 
     if res[0] == 'searching':
-        # ИСПРАВЛЕНИЕ: используем асинхронный вызов и await
         await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
-        await db_conn.commit() # Обязательно с await!
+        await db_conn.commit()
     await start_registration_flow(message, state, "🔄 Сброс настроек анкеты.\n")
 
 
@@ -646,6 +730,8 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
     async with db_conn.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
         row = await cursor.fetchone()
 
+    username_enc = encrypt_data(callback.from_user.username or f"User_{user_id}")
+
     if row is None:
         # INSERT: добавляем все обязательные поля + согласие
         await db_conn.execute(
@@ -657,7 +743,7 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
             """,
             (
                 user_id,
-                callback.from_user.username or f"User_{user_id}",
+                username_enc,
                 None, None, None, 'idle',
                 policy_version, now
             )
@@ -677,8 +763,8 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
 
     try:
         await callback.message.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug(f"Не удалось удалить сообщение с правилами: {e}")
 
     await callback.message.answer(
         "Отлично! Приступаем к настройке профиля.\nУкажи свой возраст:",
@@ -748,7 +834,7 @@ async def process_target_gender(message: Message, state: FSMContext):
         WHERE user_id = ?
         """,
         (
-            username,
+            encrypt_data(username),
             user_data['age_category'],
             user_data['gender'],
             target_val,
@@ -799,7 +885,8 @@ async def find_player(message: Message, state: FSMContext):
         await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
         return
 
-    # Теперь в запросе есть строгое условие: AND age_category = ?
+    # В запросе строгое условие: AND age_category = ? — не даёт свести в паре
+    # несовершеннолетнего (14-17) и взрослого пользователя.
     query = """
         UPDATE users 
         SET status = 'playing', current_opponent = ?, current_match_cats = 0
@@ -815,7 +902,6 @@ async def find_player(message: Message, state: FSMContext):
         RETURNING user_id
     """
     
-    # Передаем u_age последним аргументом
     async with db_conn.execute(query, (user_id, user_id, u_gender, u_target, u_target, u_age)) as cursor:
         opponent = await cursor.fetchone()
 
@@ -875,23 +961,37 @@ async def report_player_chat(message: Message):
         ORDER BY timestamp ASC
     """, (user_id, opponent_id, opponent_id, user_id, time_limit)) as cursor:
         history = await cursor.fetchall()
-    
-    history_text = ""
+
+    lines = []
     for sender, txt, ts in history:
         name = "Нарушитель" if sender == opponent_id else "Жалующийся"
         time_str = ts.split(" ")[1] if " " in ts else ts
-        
-        # === ГЛАВНЫЙ ФИКС ===
-        # Экранируем текст: превращаем символы < и > в безопасные, чтобы не ломался parse_mode="HTML"
-        safe_txt = html.escape(str(txt)) if txt else "[Медиа/Пусто]"
-        
-        history_text += f"[{time_str}] {name}: {safe_txt}\n"
 
-    if not history_text:
+        try:
+            decrypted_txt = decrypt_data(txt)
+        except Exception as e:
+            logging.error(f"Не удалось расшифровать сообщение при формировании жалобы: {e}")
+            decrypted_txt = None
+
+        # Экранируем текст: превращаем символы < и > в безопасные, чтобы не ломался parse_mode="HTML"
+        safe_txt = html.escape(decrypted_txt) if decrypted_txt else "[Медиа/Пусто]"
+        lines.append(f"[{time_str}] {name}: {safe_txt}")
+
+    if not lines:
         history_text = "<i>Сообщений за последние 20 минут в текстовом виде нет.</i>"
-    elif len(history_text) > 3000:
-        # Добавляем многоточие, чтобы было понятно, что история обрезана
-        history_text = "...\n" + history_text[-3000:] 
+    else:
+        history_text = "\n".join(lines)
+        if len(history_text) > 3000:
+            # Обрезаем по границам строк (а не посимвольно), чтобы не
+            # разорвать HTML-сущность (например "&amp;") посередине —
+            # это могло приводить к ошибке отправки сообщения с parse_mode="HTML".
+            trimmed, total = [], 0
+            for line in reversed(lines):
+                total += len(line) + 1
+                if total > 3000:
+                    break
+                trimmed.insert(0, line)
+            history_text = "...\n" + "\n".join(trimmed)
 
     report_msg = (
         f"🚨 <b>ЖАЛОБА НА ОБЩЕНИЕ (Токсичность / Спам)</b>\n\n"
@@ -910,8 +1010,6 @@ async def report_player_chat(message: Message):
         )
         await message.answer("🚨 Твоя жалоба и история чата успешно отправлены модераторам. Спасибо!")
     except Exception as e:
-        # Теперь, если ошибка всё же произойдет (например, бота удалили из чата админов), 
-        # она будет записана в логи, и вы сможете ее увидеть в консоли.
         logging.error(f"Ошибка при отправке логов чата модераторам: {e}")
         await message.answer("❌ Произошла ошибка при отправке репорта. Свяжитесь с администрацией.")
 
@@ -978,8 +1076,14 @@ async def show_leaderboard(message: Message):
         return
 
     text = "<b>🏆 ТОП-10 Котоловов:</b>\n\n"
-    for i, (username, count) in enumerate(leaders, 1):
-        display_name = f"@{username}" if username and not username.startswith("User_") else "Игрок"
+    for i, (username_blob, count) in enumerate(leaders, 1):
+        try:
+            username = decrypt_data(username_blob)
+        except Exception as e:
+            logging.error(f"Не удалось расшифровать username для таблицы лидеров: {e}")
+            username = None
+
+        display_name = f"@{html.escape(username)}" if username and not username.startswith("User_") else "Игрок"
         
         if i == 1: emoji = "🥇"
         elif i == 2: emoji = "🥈"
@@ -1083,8 +1187,8 @@ async def process_cat_check(callback: CallbackQuery):
     await callback.answer()
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug(f"Не удалось убрать клавиатуру подтверждения фото: {e}")
 
     
 
@@ -1158,8 +1262,8 @@ async def handle_chat_and_media(message: Message):
         return
 
     if message.text:
-        await db_conn.execute("INSERT INTO chat_history (sender_id, receiver_id, text) VALUES (?, ?, ?)", 
-                             (user_id, opponent_id, message.text))
+        await db_conn.execute("INSERT INTO chat_history (sender_id, receiver_id, text) VALUES (?, ?, ?)",
+                             (user_id, opponent_id, encrypt_data(message.text)))
         await db_conn.commit()
 
         try:
@@ -1174,14 +1278,19 @@ async def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     global db_conn, bot, dp
-    db_conn = await aiosqlite.connect(db_path)
+
+    if os.getenv("DEBUG") == "1":
+        _crypto_selftest()
+
+    # Соединение с БД создаётся один раз, внутри init_db().
+    # Раньше main() открывал соединение, а init_db() открывало второе и
+    # перезаписывало ссылку — первое никогда не закрывалось (утечка).
     await init_db()
-    await cleanup_old_photos()
+    await cleanup_old_data()
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
 
-    # Мидлварь вешаем ТОЛЬКО здесь, после создания dp и bot
     dp.update.middleware(BanCheckMiddleware())
     dp.include_router(router)
 
@@ -1197,6 +1306,8 @@ async def main():
             await cleanup_task
         except asyncio.CancelledError:
             pass
+        if db_conn is not None:
+            await db_conn.close()
 
 if __name__ == "__main__":
     try:
