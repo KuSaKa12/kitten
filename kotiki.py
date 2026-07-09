@@ -1,5 +1,7 @@
 import os
 import stat
+import hmac
+import hashlib
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -23,9 +25,44 @@ from aiogram import BaseMiddleware
 
 load_dotenv()
 
+# =========================================================================
+# ШИФРОВАНИЕ: AES-256-GCM (AEAD) + BLIND INDEX (HMAC-SHA256) ДЛЯ ПОИСКА
+# =========================================================================
+# По 152-ФЗ персональные данные должны храниться защищённым способом (ст. 19
+# — технические меры защиты). AES-GCM даёт конфиденциальность+целостность,
+# но он НЕДЕТЕРМИНИРОВАН (случайный nonce на каждое шифрование), поэтому
+# зашифрованный BLOB нельзя искать через "WHERE column = ?" — совпадений
+# просто не будет.
+#
+# Для полей, по которым боту реально нужен точный поиск в БД (статус,
+# пол/цель поиска, возрастная категория, идентификатор фото для защиты от
+# дублей), рядом с зашифрованным значением хранится blind index —
+# HMAC-SHA256(значение) на ОТДЕЛЬНОМ ключе. HMAC детерминирован: одинаковый
+# вход всегда даёт одинаковый хэш, поэтому по нему можно делать
+# WHERE col_idx = ?, но восстановить исходное значение из хэша нельзя.
+#
+# Важно понимать границы этого метода: если у злоумышленника есть ключ (тот
+# же секрет, что защищает и AES-часть), он может подбором по словарю
+# (например, все возможные статусы: idle/searching/playing/banned)
+# сопоставить хэши со значениями для полей с маленьким числом вариантов.
+# Это стандартный компромисс для "encryption with equality search" и
+# рассматривается как техническая мера защиты (шифрование при хранении),
+# а не как полная анонимизация. Полная анонимизация таких полей
+# несовместима с тем, что бот должен подбирать пару по этим же критериям.
+#
+# ID пользователя Telegram (user_id / current_opponent / sender_id /
+# receiver_id) НЕ шифруются: это операционный идентификатор, через который
+# бот физически отправляет сообщения через Bot API, а также первичный и
+# внешние ключи таблиц. Шифровать первичный ключ технически бессмысленно —
+# для отправки сообщения он всё равно должен быть расшифрован в исходный
+# int, и все JOIN/DELETE по нему перестанут работать без него же в
+# открытом виде.
+#
+# Поля с диапазонным поиском (uploaded_at, chat_history.timestamp) также не
+# шифруются — по вашему списку исключений и потому, что для дат нужен
+# порядок (>, <), а не только равенство, что blind index не поддерживает.
 
-
-_NONCE_LEN = 12  # рекомендованная длина nonce для GCM
+_NONCE_LEN = 12
 _TAG_LEN = 16
 
 
@@ -34,21 +71,14 @@ def get_encryption_key() -> bytes:
     if not env_key:
         raise ValueError("ENCRYPTION_KEY не задан в переменных окружения!")
 
-    # Предпочтительный вариант: 64-символьная HEX-строка = 32 случайных байта.
-    # Сгенерировать: python -c "import secrets; print(secrets.token_hex(32))"
     if len(env_key) == 64:
         try:
             key = bytes.fromhex(env_key)
             if len(key) == 32:
                 return key
         except ValueError:
-            pass  # не HEX — уходим в KDF-путь ниже
+            pass
 
-    # Фолбэк для "человекочитаемого" секрета.
-    # Раньше ключ получался обрезанием строки до первых 32 байт UTF-8 — это
-    # даёт ключ с низкой и предсказуемой энтропией, если исходная строка не
-    # случайна (обычный пароль/фраза). Пропускаем секрет через HKDF, чтобы
-    # получить полноценный равномерно распределённый 256-битный ключ.
     if len(env_key.encode('utf-8')) < 16:
         raise ValueError("ENCRYPTION_KEY слишком короткий (минимум 16 байт для режима с KDF).")
     salt = os.getenv('ENCRYPTION_KEY_SALT', 'kotoLOVe-v2-static-salt').encode('utf-8')
@@ -56,7 +86,18 @@ def get_encryption_key() -> bytes:
     return hkdf.derive(env_key.encode('utf-8'))
 
 
+def get_hmac_key() -> bytes:
+    """Отдельный ключ для blind index. Выводится из того же секрета, что и
+    ключ шифрования, но с другим 'info' в HKDF — так ключи криптографически
+    независимы (компрометация одного не даёт другой напрямую), при этом
+    не нужен второй секрет в переменных окружения."""
+    base = get_encryption_key()
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'kotoLOVe-hmac-blindindex-key')
+    return hkdf.derive(base)
+
+
 _KEY: Optional[bytes] = None
+_HMAC_KEY: Optional[bytes] = None
 
 
 def get_cached_key() -> bytes:
@@ -64,6 +105,13 @@ def get_cached_key() -> bytes:
     if _KEY is None:
         _KEY = get_encryption_key()
     return _KEY
+
+
+def get_cached_hmac_key() -> bytes:
+    global _HMAC_KEY
+    if _HMAC_KEY is None:
+        _HMAC_KEY = get_hmac_key()
+    return _HMAC_KEY
 
 
 def encrypt_data(plaintext: Optional[str]) -> Optional[bytes]:
@@ -90,22 +138,47 @@ def decrypt_data(blob: Optional[bytes]) -> Optional[str]:
     return plaintext.decode('utf-8')
 
 
+def safe_decrypt(blob: Optional[bytes], context: str = "") -> Optional[str]:
+    """decrypt_data с проглатыванием ошибки в лог вместо падения хендлера
+    (например, если БД была повреждена или ключ сменился)."""
+    if blob is None:
+        return None
+    try:
+        return decrypt_data(blob)
+    except Exception as e:
+        logging.error(f"Не удалось расшифровать поле ({context}): {e}")
+        return None
+
+
+def blind_index(value: Optional[str]) -> Optional[str]:
+    """Детерминированный псевдоним значения для точного поиска по
+    зашифрованному полю (HMAC-SHA256, отдельный ключ). НЕ является
+    шифрованием: восстановить исходное значение из индекса нельзя, но
+    одинаковые входные значения всегда дают одинаковый индекс — этого
+    достаточно для WHERE column_idx = ? без хранения самого значения в
+    открытом виде."""
+    if value is None:
+        return None
+    key = get_cached_hmac_key()
+    return hmac.new(key, value.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
 def _crypto_selftest():
-    """Самопроверка шифрования. Запускается только при DEBUG=1 и ничего
-    чувствительного в лог/консоль не пишет (только факт успеха/неудачи).
-    Раньше это была test_crypto(), которая печатала в stdout при каждом
-    импорте модуля — то есть при каждом запуске бота, включая прод."""
+    """Самопроверка шифрования и blind index. Запускается только при
+    DEBUG=1 и ничего чувствительного в лог/консоль не пишет."""
     original = "self-test-string"
     blob = encrypt_data(original)
     assert decrypt_data(blob) == original, "Расшифрованная строка не совпала с исходной"
-    logging.debug("Самопроверка шифрования пройдена успешно.")
+    idx1 = blind_index(original)
+    idx2 = blind_index(original)
+    assert idx1 == idx2, "Blind index не детерминирован"
+    assert idx1 != blind_index("другая строка"), "Blind index коллизия на разных значениях"
+    logging.debug("Самопроверка шифрования и blind index пройдена успешно.")
 
 
 class BanCheckMiddleware(BaseMiddleware):
     """Проверка бана по кэшу в памяти (banned_users_cache), а не запросом к
-    БД на каждое апдейт-событие. При большом трафике это самый "горячий"
-    путь в боте — раньше на каждое сообщение/callback уходил отдельный
-    SELECT в SQLite."""
+    БД на каждое апдейт-событие."""
 
     async def __call__(self, handler, event, data):
         user = event.from_user if hasattr(event, "from_user") else None
@@ -130,7 +203,7 @@ class BanCheckMiddleware(BaseMiddleware):
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (только ссылки, без инициализации) ---
 
 db_conn = None
-bot = None  # будет присвоен через dp.bot
+bot = None
 dp = None
 banned_users_cache: set = set()
 
@@ -159,13 +232,8 @@ async def init_db():
     os.makedirs(db_dir, exist_ok=True)
 
     if os.path.exists(db_path):
-        os.chmod(db_path, stat.S_IRUSR | stat.S_IWUSR)  # 600: rw-------
+        os.chmod(db_path, stat.S_IRUSR | stat.S_IWUSR)
 
-    # ИСПРАВЛЕНО: раньше main() создавал соединение (aiosqlite.connect), а
-    # затем init_db() создавало ВТОРОЕ соединение и перезаписывало
-    # глобальную переменную db_conn — первое соединение никогда не
-    # закрывалось (утечка файлового дескриптора). Теперь соединение
-    # создаётся один раз и только здесь.
     if db_conn is None:
         db_conn = await aiosqlite.connect(db_path)
 
@@ -177,14 +245,22 @@ async def init_db():
         user_id INTEGER PRIMARY KEY
     )''')
 
+    # user_id / current_opponent НЕ шифруются: операционный ID Telegram,
+    # первичный/внешний ключ (см. пояснение в шапке файла).
+    # Остальные персональные поля хранятся как пара (зашифрованное
+    # значение + blind index для поиска).
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        username BLOB,              -- зашифровано (AES-GCM)
-        age_category TEXT,
-        gender TEXT,
-        target_gender TEXT,
-        status TEXT DEFAULT 'idle',
+        username BLOB,                    -- зашифровано (AES-GCM)
+        age_category_enc BLOB,            -- зашифровано (AES-GCM)
+        age_category_idx TEXT,            -- blind index (HMAC) для матчинга
+        gender_enc BLOB,
+        gender_idx TEXT,
+        target_gender_enc BLOB,
+        target_gender_idx TEXT,
+        status_enc BLOB,
+        status_idx TEXT,
         current_match_cats INTEGER DEFAULT 0,
         total_cats INTEGER DEFAULT 0,
         current_opponent INTEGER DEFAULT NULL,
@@ -195,8 +271,9 @@ async def init_db():
     await db_conn.execute('''
     CREATE TABLE IF NOT EXISTS cat_photos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_unique_id TEXT NOT NULL,
-        file_id TEXT,
+        file_unique_id_enc BLOB NOT NULL, -- зашифровано (AES-GCM)
+        file_unique_id_idx TEXT NOT NULL, -- blind index для проверки дублей
+        file_id BLOB,                     -- зашифровано (AES-GCM)
         user_id INTEGER NOT NULL,
         uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
@@ -206,16 +283,12 @@ async def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender_id INTEGER,
         receiver_id INTEGER,
-        text BLOB,                  -- зашифровано (AES-GCM)
+        text BLOB,                        -- зашифровано (AES-GCM)
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
 
-    # Индексы под реальные запросы бота (раньше отсутствовали):
-    #  - поиск собеседника фильтрует по status/age_category/gender/target_gender
-    #  - проверка дубля фото ищет по file_unique_id
-    #  - очистка и жалобы фильтруют по времени и паре собеседников
-    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_users_search ON users(status, age_category, gender, target_gender)")
-    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_photos_unique ON cat_photos(file_unique_id)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_users_search ON users(status_idx, age_category_idx, gender_idx, target_gender_idx)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_photos_unique ON cat_photos(file_unique_id_idx)")
     await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_photos_uploaded_at ON cat_photos(uploaded_at)")
     await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_pair ON chat_history(sender_id, receiver_id, timestamp)")
     await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_timestamp ON chat_history(timestamp)")
@@ -225,14 +298,6 @@ async def init_db():
 
 
 async def cleanup_old_data():
-    """Раньше чистились только старые фото (>180 дней). По 152-ФЗ (ст. 5 —
-    принцип минимизации: данные хранятся не дольше, чем нужно для цели
-    обработки) переписку тоже нельзя хранить бессрочно. Штатно она и так
-    удаляется при завершении игры/бане/удалении аккаунта/повторном /start,
-    но если диалог просто "подвис" (собеседник исчез, не нажав ни одну из
-    этих кнопок), сообщения могли оставаться в БД неограниченно долго.
-    Функция жалобы (report_player_chat) смотрит только на последние 20 минут,
-    поэтому хранить историю дольше нескольких дней не требуется."""
     if db_conn is None:
         logging.warning("База данных ещё не подключена, пропускаем очистку.")
         return
@@ -252,7 +317,7 @@ async def cleanup_old_data():
 async def periodic_cleanup():
     while True:
         try:
-            await asyncio.sleep(86400)  # раз в сутки
+            await asyncio.sleep(86400)
             if db_conn is not None:
                 await cleanup_old_data()
         except asyncio.CancelledError:
@@ -263,14 +328,11 @@ async def periodic_cleanup():
             await asyncio.sleep(3600)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")  # Для системы репортов (баги/предложения)
-# ID чата модерации (группы), куда будут приходить жалобы на игроков.
-# Если не указан, упадет в личку ADMIN_ID
+ADMIN_ID = os.getenv("ADMIN_ID")
 MODERATION_CHAT_ID = os.getenv("MODERATION_CHAT_ID", ADMIN_ID)
 
 
 router = Router()
-
 
 
 class Registration(StatesGroup):
@@ -291,7 +353,7 @@ def get_delete_confirm_kb():
             InlineKeyboardButton(text="❌ Нет, отмена", callback_data="delete_confirm_no")
         ]
     ])
-    
+
 def get_age_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="14 - 17 лет"), KeyboardButton(text="18 лет и старше")]
@@ -338,7 +400,6 @@ def get_confirm_inline_kb():
         ]
     ])
 
-# Клавиатура для модерации жалоб
 def get_moderation_kb(target_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -355,12 +416,8 @@ async def check_subscription(user_id: int) -> bool:
             return True
         return False
     except Exception as e:
-        # Осознанно fail-open: при сбое Telegram API (не связанном с самой
-        # подпиской) пользователя не блокируем. Если для вашей модели угроз
-        # это неприемлемо (например, обязательность подписки — бизнес-
-        # требование), стоит переключить на fail-closed и добавить повтор.
         logging.error(f"Ошибка проверки подписки: {e}")
-        return True 
+        return True
 
 
 # --- АДМИН ПАНЕЛЬ: БАН (Ручная команда) ---
@@ -372,7 +429,7 @@ async def cmd_ban(message: Message, command: CommandObject):
     if not command.args:
         await message.answer("⚠️ Использование: /ban <ID_пользователя>\nНапример: /ban 123456789")
         return
-    
+
     try:
         target_id = int(command.args)
     except ValueError:
@@ -383,43 +440,41 @@ async def cmd_ban(message: Message, command: CommandObject):
     await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> навсегда заблокирован.", parse_mode="HTML")
 
 async def perform_ban(target_id: int):
-    # 1. Узнаём ID оппонента
     async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (target_id,)) as cursor:
         res = await cursor.fetchone()
-    
+
     if res and res[0]:
         opp_id = res[0]
 
-        # === УДАЛЕНИЕ ИСТОРИИ ЧАТА МЕЖДУ НИМИ ===
         await db_conn.execute(
             "DELETE FROM chat_history "
             "WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)",
             (target_id, opp_id, opp_id, target_id)
         )
 
-        # Сбрасываем статус оппонента
         await db_conn.execute(
-            "UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?",
-            (opp_id,)
+            "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = NULL WHERE user_id = ?",
+            (encrypt_data('idle'), blind_index('idle'), opp_id)
         )
         await db_conn.commit()
-        
+
         try:
             await bot.send_message(
-                opp_id, 
-                "🚨 Твой собеседник был заблокирован администратором за нарушение правил. Игра завершена.", 
+                opp_id,
+                "🚨 Твой собеседник был заблокирован администратором за нарушение правил. Игра завершена.",
                 reply_markup=get_main_menu()
             )
         except Exception as e:
             logging.warning(f"Не удалось уведомить оппонента {opp_id} о бане: {e}")
 
-    # 2. Сам бан: в таблицу banned_users и обновление статуса
     await db_conn.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (target_id,))
-    await db_conn.execute("UPDATE users SET status = 'banned', current_opponent = NULL WHERE user_id = ?", (target_id,))
+    await db_conn.execute(
+        "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = NULL WHERE user_id = ?",
+        (encrypt_data('banned'), blind_index('banned'), target_id)
+    )
     await db_conn.commit()
     banned_users_cache.add(target_id)
 
-    # Уведомление нарушителю
     try:
         await bot.send_message(
             target_id,
@@ -428,7 +483,6 @@ async def perform_ban(target_id: int):
         )
     except Exception as e:
         logging.warning(f"Не удалось отправить сообщение о бане пользователю {target_id}: {e}")
-
 
 
 # Команда для удаления данных
@@ -443,7 +497,6 @@ async def cmd_delete_data(message: Message):
         parse_mode="HTML"
     )
 
-# Обработка нажатия на кнопки удаления
 @router.callback_query(F.data.startswith("delete_confirm_"))
 async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -454,25 +507,21 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # 1. Получаем ID оппонента ДО удаления
     async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
     opp_id = res[0] if res else None
 
-    # 2. Выполняем очистку базы
     try:
-        # Сначала сбрасываем состояние оппонента, если он есть
         if opp_id:
             await db_conn.execute(
-                "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?", 
-                (opp_id,)
+                "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?",
+                (encrypt_data('idle'), blind_index('idle'), opp_id)
             )
 
-        # Удаляем пользователя и его данные
         await db_conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         await db_conn.execute("DELETE FROM cat_photos WHERE user_id = ?", (user_id,))
         await db_conn.execute("DELETE FROM chat_history WHERE sender_id = ? OR receiver_id = ?", (user_id, user_id))
-        
+
         await db_conn.commit()
 
     except Exception as e:
@@ -482,18 +531,16 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # 3. Уведомляем оппонента (внешнее взаимодействие)
     if opp_id:
         try:
             await callback.bot.send_message(
-                opp_id, 
-                "⚠️ Твой собеседник удалил свой профиль. Игра завершена.", 
+                opp_id,
+                "⚠️ Твой собеседник удалил свой профиль. Игра завершена.",
                 reply_markup=get_main_menu()
             )
         except Exception as e:
             logging.warning(f"Не удалось уведомить оппонента {opp_id} об удалении: {e}")
 
-    # 4. Завершаем работу
     await state.clear()
     await callback.message.edit_text("🗑 Все твои данные были успешно удалены из базы. Надеемся еще увидеть тебя!")
     await callback.answer("Данные удалены.")
@@ -503,7 +550,7 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
 async def mod_ban_handler(callback: CallbackQuery):
     target_id = int(callback.data.split(":")[1])
     await perform_ban(target_id)
-    
+
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply(f"🔨 <b>Решение принято:</b> Пользователь <code>{target_id}</code> ЗАБАНЕН.", parse_mode="HTML")
@@ -522,7 +569,6 @@ async def mod_dismiss_handler(callback: CallbackQuery):
     await callback.answer("Жалоба отклонена.")
 
 
-# --- ФУНКЦИЯ СТАРТА РЕГИСТРАЦИИ ---
 async def start_registration_flow(message: Message, state: FSMContext, text_prefix=""):
     await message.answer(
         f"{text_prefix}Давай настроим твой профиль. Укажи свой возраст:",
@@ -530,7 +576,6 @@ async def start_registration_flow(message: Message, state: FSMContext, text_pref
     )
     await state.set_state(Registration.waiting_for_age)
 
-# --- ФУНКЦИЯ РАЗБАНА ---
 @router.message(Command("unban"))
 async def cmd_unban(message: Message, command: CommandObject):
     if str(message.from_user.id) != str(ADMIN_ID):
@@ -539,28 +584,27 @@ async def cmd_unban(message: Message, command: CommandObject):
     if not command.args:
         await message.answer("⚠️ Использование: /unban <ID>")
         return
-        
+
     try:
         target_id = int(command.args)
-        # Удаляем из вечного бана
         await db_conn.execute("DELETE FROM banned_users WHERE user_id = ?", (target_id,))
-        # Обновляем статус в таблице юзеров (если он не удалил аккаунт)
-        await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ? AND status = 'banned'", (target_id,))
+        await db_conn.execute(
+            "UPDATE users SET status_enc = ?, status_idx = ? WHERE user_id = ? AND status_idx = ?",
+            (encrypt_data('idle'), blind_index('idle'), target_id, blind_index('banned'))
+        )
         await db_conn.commit()
         banned_users_cache.discard(target_id)
-        
+
         await message.answer(f"✅ Пользователь <code>{target_id}</code> успешно разбанен!", parse_mode="HTML")
     except ValueError:
         await message.answer("❌ ID должен быть числом.")
-        
+
 # --- СИСТЕМА ОБЫЧНЫХ РЕПОРТОВ (БАГИ, ПРЕДЛОЖЕНИЯ РАЗРАБУ) ---
 @router.message(Command("report"))
 async def cmd_report(message: Message, state: FSMContext):
-    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
-        res = await cursor.fetchone()  # ИСПРАВЛЕНО: раньше не было await —
-        # res был объектом-корутиной, а не строкой из БД, и res[0] упал бы
-        # с TypeError при каждом вызове /report.
-    if res and res[0] == 'banned':
+    async with db_conn.execute("SELECT status_enc FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
+        res = await cursor.fetchone()
+    if res and safe_decrypt(res[0], "cmd_report.status") == 'banned':
         return
 
     await message.answer("📝 Напиши своё предложение или баг-репорт (можно прикрепить скриншот) <b>одним сообщением</b>, и я передам его создателю бота!", parse_mode="HTML")
@@ -569,35 +613,30 @@ async def cmd_report(message: Message, state: FSMContext):
 @router.message(ReportState.waiting_for_text)
 async def process_report(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    
+
     async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
     opp_id_text = f"Последний собеседник ID: <code>{res[0]}</code>" if res and res[0] else "Собеседника нет"
 
-    # ИСПРАВЛЕНО: раньше username и текст репорта подставлялись в
-    # HTML-сообщение админу БЕЗ экранирования (parse_mode="HTML"). Любой
-    # пользователь мог вставить в юзернейм/текст произвольные HTML-теги —
-    # от поломки форматирования и битых ссылок в чате админа/модерации до
-    # отказа отправки сообщения из-за невалидного HTML.
     safe_username = html.escape(message.from_user.username or 'без_юзернейма')
     user_info = f"От: @{safe_username} (ID: <code>{user_id}</code>)\n{opp_id_text}"
 
     raw_text = message.text or message.caption
     report_text = html.escape(raw_text) if raw_text else "<i>Без текста</i>"
-    
+
     if ADMIN_ID:
         try:
             if message.photo:
                 await bot.send_photo(
-                    ADMIN_ID, 
-                    message.photo[-1].file_id, 
-                    caption=f"🔔 <b>Новый отзыв/репорт (с фото)!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
+                    ADMIN_ID,
+                    message.photo[-1].file_id,
+                    caption=f"🔔 <b>Новый отзыв/репорт (с фото)!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}",
                     parse_mode="HTML"
                 )
             else:
                 await bot.send_message(
-                    ADMIN_ID, 
-                    f"🔔 <b>Новый отзыв/репорт!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}", 
+                    ADMIN_ID,
+                    f"🔔 <b>Новый отзыв/репорт!</b>\n{user_info}\n\n<b>Текст:</b>\n{report_text}",
                     parse_mode="HTML"
                 )
             await message.answer("✅ Спасибо! Твой отзыв успешно отправлен разработчику.")
@@ -606,7 +645,7 @@ async def process_report(message: Message, state: FSMContext):
             await message.answer("❌ Произошла ошибка при отправке. Попробуй позже.")
     else:
         await message.answer("❌ Администратор бота временно недоступен, но твой репорт принят в космос!")
-    
+
     await state.clear()
 
 
@@ -615,35 +654,33 @@ async def process_report(message: Message, state: FSMContext):
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    # Проверка бана (как у тебя)
     async with db_conn.execute("SELECT user_id FROM banned_users WHERE user_id = ?", (user_id,)) as cursor:
         if await cursor.fetchone():
             await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
             return
 
-    async with db_conn.execute("SELECT age_category, status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    async with db_conn.execute("SELECT age_category_enc, status_enc FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
-    if res and res[1] == 'banned':
+    age_val = safe_decrypt(res[0], "cmd_start.age") if res else None
+    status_val = safe_decrypt(res[1], "cmd_start.status") if res else None
+
+    if res and status_val == 'banned':
         await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
         return
 
-    # Если пользователь был в игре/поиске — сбрасываем статус
-    if res and res[0] is not None:
+    if res and age_val is not None:
         await db_conn.execute(
-            "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?",
-            (user_id,)
+            "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = NULL, current_match_cats = 0 WHERE user_id = ?",
+            (encrypt_data('idle'), blind_index('idle'), user_id)
         )
 
-        # === УДАЛЕНИЕ ВСЕЙ ИСТОРИИ ДЛЯ ЭТОГО ПОЛЬЗОВАТЕЛЯ ===
-        # Это соответствует твоей политике: сессия завершена, данные не храним
         await db_conn.execute(
             "DELETE FROM chat_history WHERE sender_id = ? OR receiver_id = ?",
             (user_id, user_id)
         )
         await db_conn.commit()
 
-    # Дальше как у тебя: правила и клавиатура
     rules_text = (
         "🐾 <b>Добро пожаловать в «котоLOVе»!</b>\n"
         "<i>Твой уютный уголок для знакомств, общения и поиска друзей через любовь к хвостикам.</i> 🐈\n\n"
@@ -662,8 +699,8 @@ async def cmd_start(message: Message, state: FSMContext):
         "👇 <i>Нажимая кнопку ниже, ты подтверждаешь, что принимаешь <a href='https://docs.google.com/document/d/1b_JCf_2SJR3hUNie0USd2h8vSmk0Z-TpBfVVwVvR7Wk/edit?usp=sharing'>Пользовательское соглашение</a> и <a href='https://docs.google.com/document/d/1Z99gTfiVyo3CaDZXbqSJ1lsqw2Rp3VuvjjdojzZWTQw/edit?usp=sharing'>Политику конфиденциальности</a>, и готов(а) соблюдать правила сервиса!</i>"
     )
     await message.answer(
-        rules_text, 
-        reply_markup=get_rules_inline_kb(), 
+        rules_text,
+        reply_markup=get_rules_inline_kb(),
         parse_mode="HTML",
         disable_web_page_preview=True
     )
@@ -674,25 +711,29 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(F.text == "⚙️ Изменить профиль")
 async def change_profile(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    
-    # Теперь правильно: res находится ВНУТРИ блока
-    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+
+    async with db_conn.execute("SELECT status_enc FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
     if not res:
         await cmd_start(message, state)
         return
 
-    if res[0] == 'banned':
+    status_val = safe_decrypt(res[0], "change_profile.status")
+
+    if status_val == 'banned':
         await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
         return
 
-    if res[0] == 'playing':
+    if status_val == 'playing':
         await message.answer("Вы не можете изменить профиль во время общения! Сначала завершите текущий диалог.")
         return
 
-    if res[0] == 'searching':
-        await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
+    if status_val == 'searching':
+        await db_conn.execute(
+            "UPDATE users SET status_enc = ?, status_idx = ? WHERE user_id = ?",
+            (encrypt_data('idle'), blind_index('idle'), user_id)
+        )
         await db_conn.commit()
     await start_registration_flow(message, state, "🔄 Сброс настроек анкеты.\n")
 
@@ -709,23 +750,28 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
     username_enc = encrypt_data(callback.from_user.username or f"User_{user_id}")
 
     if row is None:
-        # INSERT: добавляем все обязательные поля + согласие
         await db_conn.execute(
             """
             INSERT INTO users (
-                user_id, username, age_category, gender, target_gender, status,
+                user_id, username,
+                age_category_enc, age_category_idx,
+                gender_enc, gender_idx,
+                target_gender_enc, target_gender_idx,
+                status_enc, status_idx,
                 consent_policy_version, consent_timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
                 username_enc,
-                None, None, None, 'idle',
+                None, None,
+                None, None,
+                None, None,
+                encrypt_data('idle'), blind_index('idle'),
                 policy_version, now
             )
         )
     else:
-        # UPDATE: обновляем только согласие
         await db_conn.execute(
             """
             UPDATE users
@@ -753,7 +799,7 @@ async def process_rules_callback(callback: CallbackQuery, state: FSMContext):
 @router.message(Registration.waiting_for_age)
 async def process_age(message: Message, state: FSMContext):
     valid_ages = ["14 - 17 лет", "18 лет и старше"]
-    
+
     if message.text not in valid_ages:
         await message.answer("Пожалуйста, выбери вариант на клавиатуре!")
         return
@@ -789,7 +835,6 @@ async def process_target_gender(message: Message, state: FSMContext):
     elif message.text == "Девушку":
         target_val = "female"
 
-    # Читаем total_cats ДО обновления
     async with db_conn.execute(
         "SELECT total_cats FROM users WHERE user_id = ?",
         (user_id,)
@@ -801,19 +846,20 @@ async def process_target_gender(message: Message, state: FSMContext):
         """
         UPDATE users
         SET username = ?,
-            age_category = ?,
-            gender = ?,
-            target_gender = ?,
-            status = 'idle',
+            age_category_enc = ?, age_category_idx = ?,
+            gender_enc = ?, gender_idx = ?,
+            target_gender_enc = ?, target_gender_idx = ?,
+            status_enc = ?, status_idx = ?,
             current_match_cats = 0,
             total_cats = ?
         WHERE user_id = ?
         """,
         (
             encrypt_data(username),
-            user_data['age_category'],
-            user_data['gender'],
-            target_val,
+            encrypt_data(user_data['age_category']), blind_index(user_data['age_category']),
+            encrypt_data(user_data['gender']), blind_index(user_data['gender']),
+            encrypt_data(target_val), blind_index(target_val),
+            encrypt_data('idle'), blind_index('idle'),
             total_cats_to_save,
             user_id
         )
@@ -832,7 +878,7 @@ async def process_target_gender(message: Message, state: FSMContext):
 @router.message(F.text == "🔍 Найти игрока")
 async def find_player(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    
+
     if not await check_subscription(user_id):
         await message.answer(
             f"❌ Чтобы играть, нужно подписаться на наш канал: {CHANNEL_ID}\n\n"
@@ -843,15 +889,20 @@ async def find_player(message: Message, state: FSMContext):
         )
         return
 
-    # Читаем возраст (age_category) из БД вместе с остальными данными
-    async with db_conn.execute("SELECT status, gender, target_gender, age_category FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    async with db_conn.execute(
+        "SELECT status_enc, gender_enc, target_gender_enc, age_category_enc FROM users WHERE user_id = ?",
+        (user_id,)
+    ) as cursor:
         u_data = await cursor.fetchone()
-    
+
     if not u_data:
         await cmd_start(message, state)
         return
 
-    current_status, u_gender, u_target, u_age = u_data
+    current_status = safe_decrypt(u_data[0], "find_player.status")
+    u_gender = safe_decrypt(u_data[1], "find_player.gender")
+    u_target = safe_decrypt(u_data[2], "find_player.target_gender")
+    u_age = safe_decrypt(u_data[3], "find_player.age_category")
 
     if current_status == 'banned':
         await message.answer("❌ Вы навсегда заблокированы за нарушение правил сервиса.")
@@ -861,64 +912,78 @@ async def find_player(message: Message, state: FSMContext):
         await message.answer("Ты уже находишься в активной игре!", reply_markup=get_game_menu())
         return
 
-    # В запросе строгое условие: AND age_category = ? — не даёт свести в паре
+    searching_idx = blind_index('searching')
+    any_idx = blind_index('any')
+    u_gender_idx = blind_index(u_gender)
+    u_target_idx = blind_index(u_target)
+    u_age_idx = blind_index(u_age)
+
+    # Строгое условие AND age_category_idx = ? — не даёт свести в паре
     # несовершеннолетнего (14-17) и взрослого пользователя.
     query = """
-        UPDATE users 
-        SET status = 'playing', current_opponent = ?, current_match_cats = 0
+        UPDATE users
+        SET status_enc = ?, status_idx = ?, current_opponent = ?, current_match_cats = 0
         WHERE user_id = (
-            SELECT user_id FROM users 
-            WHERE status = 'searching' 
-              AND user_id != ? 
-              AND (target_gender = 'any' OR target_gender = ?)
-              AND (? = 'any' OR gender = ?)
-              AND age_category = ? 
+            SELECT user_id FROM users
+            WHERE status_idx = ?
+              AND user_id != ?
+              AND (target_gender_idx = ? OR target_gender_idx = ?)
+              AND (? = ? OR gender_idx = ?)
+              AND age_category_idx = ?
             LIMIT 1
         )
         RETURNING user_id
     """
-    
-    async with db_conn.execute(query, (user_id, user_id, u_gender, u_target, u_target, u_age)) as cursor:
+
+    async with db_conn.execute(
+        query,
+        (
+            encrypt_data('playing'), blind_index('playing'), user_id,
+            searching_idx, user_id,
+            any_idx, u_gender_idx,
+            u_target_idx, any_idx, u_target_idx,
+            u_age_idx
+        )
+    ) as cursor:
         opponent = await cursor.fetchone()
 
     if opponent:
         opponent_id = opponent[0]
-        
+
         await db_conn.execute(
-            "UPDATE users SET status = 'playing', current_opponent = ?, current_match_cats = 0 WHERE user_id = ?", 
-            (opponent_id, user_id)
+            "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = ?, current_match_cats = 0 WHERE user_id = ?",
+            (encrypt_data('playing'), blind_index('playing'), opponent_id, user_id)
         )
         await db_conn.commit()
 
         await message.answer("🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
         await bot.send_message(opponent_id, "🎉 Собеседник найден! Начинаем общение. Присылай фото котиков!", reply_markup=get_game_menu())
     else:
-        await db_conn.execute("UPDATE users SET status = 'searching', current_opponent = NULL WHERE user_id = ?", (user_id,))
+        await db_conn.execute(
+            "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = NULL WHERE user_id = ?",
+            (encrypt_data('searching'), blind_index('searching'), user_id)
+        )
         await db_conn.commit()
         await message.answer("🔍 Ищем собеседника... Пожалуйста, подожди.", reply_markup=get_search_menu())
 
 
 # --- ОСТАНОВКА ПОИСКА ---
-# У этой кнопки никогда не было обработчика — ни в исходном коде, ни в
-# предыдущей версии. Нажатие проваливалось в общий catch-all
-# (handle_chat_and_media), который подменял клавиатуру на главное меню, но
-# статус пользователя в БД оставался 'searching'. Отсюда и эффект «кнопка
-# пропала»: клавиатура визуально менялась, а поиск по факту не
-# останавливался.
 @router.message(F.text == "🛑 Остановить поиск")
 async def stop_search(message: Message):
     user_id = message.from_user.id
 
-    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    async with db_conn.execute("SELECT status_enc FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
-    if not res or res[0] != 'searching':
+    status_val = safe_decrypt(res[0], "stop_search.status") if res else None
+
+    if not res or status_val != 'searching':
         await message.answer("Ты сейчас не в поиске.", reply_markup=get_main_menu())
         return
 
     await db_conn.execute(
-        "UPDATE users SET status = 'idle', current_opponent = NULL WHERE user_id = ?",
-        (user_id,)
+        "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = NULL WHERE user_id = ?",
+        (encrypt_data('idle'), blind_index('idle'), user_id)
     )
     await db_conn.commit()
     await message.answer("🛑 Поиск остановлен.", reply_markup=get_main_menu())
@@ -928,36 +993,38 @@ async def stop_search(message: Message):
 @router.message(F.text == "🏁 Завершить игру")
 async def ask_end_game(message: Message):
     user_id = message.from_user.id
-    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    async with db_conn.execute("SELECT status_enc FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
-    if res and res[0] == 'playing':
+    status_val = safe_decrypt(res[0], "ask_end_game.status") if res else None
+
+    if status_val == 'playing':
         await message.answer(
             "⚠️ Ты уверен, что хочешь завершить диалог?\n"
             "Твой счётчик котов в этой игре сбросится!",
             reply_markup=get_confirm_inline_kb()
         )
-    elif res and res[0] == 'banned':
+    elif status_val == 'banned':
         return
     else:
         await message.answer("Ты сейчас не в игре.", reply_markup=get_main_menu())
 
 
 # --- ЖАЛОБА НА СОБЕСЕДНИКА ВО ВРЕМЯ ИГРЫ (ТОКСИЧНОСТЬ) ---
-
-
 @router.message(F.text == "🚨 Пожаловаться на собеседника")
 async def report_player_chat(message: Message):
     user_id = message.from_user.id
-    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    async with db_conn.execute("SELECT status_enc, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
-    if not res or res[0] != 'playing':
+    status_val = safe_decrypt(res[0], "report_player_chat.status") if res else None
+
+    if not res or status_val != 'playing':
         return await message.answer("Эта функция доступна только во время игры.")
 
     opponent_id = res[1]
     time_limit = (datetime.now() - timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
-    
+
     async with db_conn.execute("""
         SELECT sender_id, text, timestamp FROM chat_history
         WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
@@ -971,13 +1038,8 @@ async def report_player_chat(message: Message):
         name = "Нарушитель" if sender == opponent_id else "Жалующийся"
         time_str = ts.split(" ")[1] if " " in ts else ts
 
-        try:
-            decrypted_txt = decrypt_data(txt)
-        except Exception as e:
-            logging.error(f"Не удалось расшифровать сообщение при формировании жалобы: {e}")
-            decrypted_txt = None
+        decrypted_txt = safe_decrypt(txt, "report_player_chat.text")
 
-        # Экранируем текст: превращаем символы < и > в безопасные, чтобы не ломался parse_mode="HTML"
         safe_txt = html.escape(decrypted_txt) if decrypted_txt else "[Медиа/Пусто]"
         lines.append(f"[{time_str}] {name}: {safe_txt}")
 
@@ -986,9 +1048,6 @@ async def report_player_chat(message: Message):
     else:
         history_text = "\n".join(lines)
         if len(history_text) > 3000:
-            # Обрезаем по границам строк (а не посимвольно), чтобы не
-            # разорвать HTML-сущность (например "&amp;") посередине —
-            # это могло приводить к ошибке отправки сообщения с parse_mode="HTML".
             trimmed, total = [], 0
             for line in reversed(lines):
                 total += len(line) + 1
@@ -1022,39 +1081,35 @@ async def report_player_chat(message: Message):
 async def process_confirm_exit(callback: CallbackQuery):
     user_id = callback.from_user.id
     action = callback.data.split("_")[-1]
-    
+
     if action == "no":
         await callback.message.edit_text("✅ Игра продолжается!")
         await callback.answer()
         return
 
-    # Получаем текущего оппонента
     async with db_conn.execute("SELECT current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
     if not res or not res[0]:
         await callback.answer("Ты не в игре.", show_alert=True)
         return
-    
+
     opponent_id = res[0]
 
-    # === УДАЛЕНИЕ ИСТОРИИ ЧАТА ===
     await db_conn.execute(
         "DELETE FROM chat_history "
         "WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)",
         (user_id, opponent_id, opponent_id, user_id)
     )
 
-    # Сбрасываем статусы обоих
     await db_conn.execute(
-        "UPDATE users SET status = 'idle', current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
-        (user_id, opponent_id)
+        "UPDATE users SET status_enc = ?, status_idx = ?, current_opponent = NULL, current_match_cats = 0 WHERE user_id IN (?, ?)",
+        (encrypt_data('idle'), blind_index('idle'), user_id, opponent_id)
     )
     await db_conn.commit()
 
     await callback.message.edit_text("🏁 Игра завершена.")
     await callback.answer()
 
-    # Сообщаем оппоненту
     try:
         await bot.send_message(
             opponent_id,
@@ -1067,38 +1122,32 @@ async def process_confirm_exit(callback: CallbackQuery):
 # --- ТАБЛИЦА ЛИДЕРОВ ---
 @router.message(F.text == "🏆 Таблица лидеров")
 async def show_leaderboard(message: Message):
-    async with db_conn.execute("SELECT status FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
+    async with db_conn.execute("SELECT status_enc FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
         res = await cursor.fetchone()
-    if res and res[0] == 'banned':
+    if res and safe_decrypt(res[0], "show_leaderboard.status") == 'banned':
         return
 
     async with db_conn.execute("SELECT username, total_cats FROM users ORDER BY total_cats DESC LIMIT 10") as cursor:
         leaders = await cursor.fetchall()
-    
+
     if not leaders:
         await message.answer("🏆 Пока в таблице лидеров пусто.")
         return
 
     text = "<b>🏆 ТОП-10 Котоловов:</b>\n\n"
     for i, (username_blob, count) in enumerate(leaders, 1):
-        try:
-            username = decrypt_data(username_blob)
-        except Exception as e:
-            logging.error(f"Не удалось расшифровать username для таблицы лидеров: {e}")
-            username = None
+        username = safe_decrypt(username_blob, "show_leaderboard.username")
 
         display_name = f"@{html.escape(username)}" if username and not username.startswith("User_") else "Игрок"
-        
+
         if i == 1: emoji = "🥇"
         elif i == 2: emoji = "🥈"
         elif i == 3: emoji = "🥉"
         else: emoji = "🔹"
-        
+
         text += f"{emoji} {display_name} — 🐈 <b>{count}</b>\n"
-    
+
     await message.answer(text, parse_mode="HTML")
-
-
 
 
 # --- ОБРАБОТКА ФОТО ВЕРИФИКАЦИИ (И ЖАЛОБ НА ФОТО) ---
@@ -1109,13 +1158,12 @@ async def process_cat_check(callback: CallbackQuery):
         await callback.answer("Ошибка данных кнопки", show_alert=True)
         return
 
-    action = parts[1]          # yes / no / report
+    action = parts[1]
     sender_id = int(parts[2])
-    photo_record_id = int(parts[3])  # это внутренний id из таблицы cat_photos
+    photo_record_id = int(parts[3])
 
-    # Получаем данные фото по внутреннему ID
     async with db_conn.execute(
-        "SELECT file_id, file_unique_id, user_id FROM cat_photos WHERE id = ?",
+        "SELECT file_id, file_unique_id_idx, user_id FROM cat_photos WHERE id = ?",
         (photo_record_id,)
     ) as cursor:
         row = await cursor.fetchone()
@@ -1124,9 +1172,9 @@ async def process_cat_check(callback: CallbackQuery):
         await callback.answer("Фото не найдено в базе", show_alert=True)
         return
 
-    file_id, file_unique_id, stored_user_id = row
+    file_id_blob, file_unique_id_idx, stored_user_id = row
+    file_id = safe_decrypt(file_id_blob, "process_cat_check.file_id")
 
-    # Проверка: только владелец фото может подтверждать/жаловаться
     if stored_user_id != sender_id:
         await callback.answer("Это не твоё фото!", show_alert=True)
         return
@@ -1151,16 +1199,14 @@ async def process_cat_check(callback: CallbackQuery):
             await callback.answer("Нет чата модерации.", show_alert=True)
 
     elif action == "yes":
-        # Проверка: не было ли это фото уже засчитано кому-то другому
         async with db_conn.execute(
-            "SELECT id FROM cat_photos WHERE file_unique_id = ? AND user_id != ?",
-            (file_unique_id, sender_id)
+            "SELECT id FROM cat_photos WHERE file_unique_id_idx = ? AND user_id != ?",
+            (file_unique_id_idx, sender_id)
         ) as cursor:
             if await cursor.fetchone():
                 await callback.answer("❌ Это фото уже использовалось другим игроком!", show_alert=True)
                 return
 
-        # Начисление баллов
         await db_conn.execute(
             """
             UPDATE users
@@ -1172,7 +1218,6 @@ async def process_cat_check(callback: CallbackQuery):
         )
         await db_conn.commit()
 
-        # Получение обновлённых баллов
         async with db_conn.execute("SELECT current_match_cats FROM users WHERE user_id = ?", (sender_id,)) as cursor:
             row = await cursor.fetchone()
             sender_score = row[0] if row else 0
@@ -1194,21 +1239,21 @@ async def process_cat_check(callback: CallbackQuery):
     except Exception as e:
         logging.debug(f"Не удалось убрать клавиатуру подтверждения фото: {e}")
 
-    
-
 
 # --- ОБРАБОТКА ЧАТА И КАРТИНОК ---
 @router.message()
 async def handle_chat_and_media(message: Message):
     user_id = message.from_user.id
-    
-    async with db_conn.execute("SELECT status, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
+
+    async with db_conn.execute("SELECT status_enc, current_opponent FROM users WHERE user_id = ?", (user_id,)) as cursor:
         res = await cursor.fetchone()
 
-    if not res or res[0] == 'banned':
+    status_val = safe_decrypt(res[0], "handle_chat_and_media.status") if res else None
+
+    if not res or status_val == 'banned':
         return
 
-    if res[0] != 'playing':
+    if status_val != 'playing':
         if message.photo:
             await message.answer("❌ Ты не можешь отправлять котиков просто так! Сначала нажми «🔍 Найти игрока».")
         elif message.text not in ["🔍 Найти игрока", "🏆 Таблица лидеров", "⚙️ Изменить профиль"]:
@@ -1217,7 +1262,10 @@ async def handle_chat_and_media(message: Message):
 
     opponent_id = res[1]
     if not opponent_id:
-        await db_conn.execute("UPDATE users SET status = 'idle' WHERE user_id = ?", (user_id,))
+        await db_conn.execute(
+            "UPDATE users SET status_enc = ?, status_idx = ? WHERE user_id = ?",
+            (encrypt_data('idle'), blind_index('idle'), user_id)
+        )
         await db_conn.commit()
         await message.answer("⚠️ Ошибка: собеседник потерян. Пожалуйста, начни поиск заново.", reply_markup=get_main_menu())
         return
@@ -1226,17 +1274,17 @@ async def handle_chat_and_media(message: Message):
         photo = message.photo[-1]
         file_id = photo.file_id
         file_unique_id = photo.file_unique_id
-    
+
         cursor = await db_conn.execute(
             """
-            INSERT INTO cat_photos (file_unique_id, file_id, user_id, uploaded_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO cat_photos (file_unique_id_enc, file_unique_id_idx, file_id, user_id, uploaded_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (file_unique_id, file_id, user_id, datetime.now())
+            (encrypt_data(file_unique_id), blind_index(file_unique_id), encrypt_data(file_id), user_id, datetime.now())
         )
         photo_record_id = cursor.lastrowid
         await db_conn.commit()
-    
+
         verify_kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="🐱 Да, это кот!", callback_data=f"check_cat:yes:{user_id}:{photo_record_id}"),
@@ -1246,9 +1294,9 @@ async def handle_chat_and_media(message: Message):
                 InlineKeyboardButton(text="🚨 Пожаловаться (НСФВ/Спам)", callback_data=f"check_cat:report:{user_id}:{photo_record_id}")
             ]
         ])
-    
+
         await message.answer("⏳ Отправил фото собеседнику на подтверждение...")
-    
+
         try:
             await bot.send_photo(
                 opponent_id,
@@ -1259,7 +1307,6 @@ async def handle_chat_and_media(message: Message):
             )
         except Exception as e:
             logging.error(f"Не удалось отправить фото оппоненту {opponent_id}: {e}")
-            # Удаляем запись о фото, если оно не доставлено — это соответствует политике «не храним лишнее»
             await db_conn.execute("DELETE FROM cat_photos WHERE id = ?", (photo_record_id,))
             await db_conn.commit()
             await message.answer("❌ Не удалось доставить фото собеседнику. Попробуй ещё раз позже.")
@@ -1286,9 +1333,6 @@ async def main():
     if os.getenv("DEBUG") == "1":
         _crypto_selftest()
 
-    # Соединение с БД создаётся один раз, внутри init_db().
-    # Раньше main() открывал соединение, а init_db() открывало второе и
-    # перезаписывало ссылку — первое никогда не закрывалось (утечка).
     await init_db()
     await cleanup_old_data()
 
